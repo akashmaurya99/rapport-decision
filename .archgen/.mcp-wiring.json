@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "servers": {
+    "codegraph": {
+      "writtenAt": "2026-11-19T13:32:39.791Z",
+      "entries": [
+        {
+          "harness": "codex",
+          "location": "global",
+          "path": "/Users/akashmaurya/.codex/config.toml",
+          "key": "mcp_servers.codegraph"
+        }
+      ]
+    }
+  }
+}

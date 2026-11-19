@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "createdAt": "2026-11-19T13:32:36.605Z",
+  "entries": [
+    {
+      "kind": "dir",
+      "path": ".agents/skills/archgen",
+      "createdAt": "2026-11-19T13:32:36.605Z"
+    },
+    {
+      "kind": "link",
+      "path": ".claude/skills/archgen",
+      "createdAt": "2026-11-19T13:32:36.606Z"
+    },
+    {
+      "kind": "block",
+      "path": "AGENTS.md",
+      "createdAt": "2026-11-19T13:32:36.606Z"
+    },
+    {
+      "kind": "block",
+      "path": "CLAUDE.md",
+      "createdAt": "2026-11-19T13:32:36.607Z"
+    }
+  ]
+}
