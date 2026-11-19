@@ -263,7 +263,7 @@ tasks:
       - "the option-count sweep reports accuracy and bucket ECE for n in 2..8, and the held-out-source block is computed only on sources with zero training rows (covers FR-EVAL-03)"
       - contradictory-context and missing-information cases report the change in abstention rate explicitly (covers FR-EVAL-03)
       - "the length sweep reports choice accuracy and bucket ECE at 512, 768 and 1024 tokens; a drop exceeding 2 points at 1024 is reported as a failure of the 1024 extension claim (covers FR-EVAL-03)"
-    status: running
+    status: done
   - id: TASK-20
     title: "Structured logging, run registry and reproducibility checks"
     depends_on:
