@@ -1,0 +1,34 @@
+{
+  "example_id": "555154b59729bb5cd9d9d52f556d6f09ad63a91cbecfe54dbfb4e579f73015a6",
+  "task_family": "choice",
+  "goal": "Choose the cheapest migration path",
+  "state": "The service runs three Postgres primaries across two regions and the budget allows two more instances.",
+  "options": [
+    {
+      "text": "Lift and shift both regions",
+      "label": "A"
+    },
+    {
+      "text": "Consolidate to one region and add read replicas",
+      "label": "B"
+    },
+    {
+      "text": "Stay put and tune existing instances",
+      "label": "C"
+    }
+  ],
+  "chosen_index": 1,
+  "scores": [
+    0.2,
+    0.65,
+    0.15
+  ],
+  "answerable": true,
+  "risk_labels": [
+    "data_loss"
+  ],
+  "source": "fixture/canonical",
+  "license": "CC-BY-4.0",
+  "group_id": "fixture-group-0001",
+  "split": "train"
+}
