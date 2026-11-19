@@ -45,6 +45,7 @@ tasks:
       - "normalize_example rejects an empty goal, fewer than two options, a duplicate option after normalization, and an out-of-range chosen index, each with a distinct typed error code (covers E3) (covers FR-DATA-01)"
       - "example_id is order-invariant: permuting options leaves the sha256 unchanged, and a fixture round-trips through parse, validate and serialize with an identical hash"
       - "normalization applies Unicode NFC, strips HTML and collapses whitespace, and records nothing that a source did not provide"
+    status: done
   - id: TASK-04
     title: "Tokenizer, special tokens and length bucketing"
     depends_on:
@@ -70,6 +71,7 @@ tasks:
       - RapportConfig renders the layer table in docs/architecture-spec.md and count_parameters reports each component within 1 percent of it; the RAPPORT-C trunk is 21.24M parameters (covers FR-MODEL-01)
       - "the trunk emits [B, 512, 384] for a fixed batch and RoPE with base 10000 is the only position mechanism in the implementation"
       - the counter fails the build when the implementation and the spec disagree by more than 1 percent (covers FR-MODEL-01)
+    status: done
   - id: TASK-06
     title: "Marker readout, six heads and model assembly"
     depends_on:
@@ -221,6 +223,7 @@ tasks:
       - "metrics compute accuracy, macro-F1, NDCG@k, Spearman, Pearson, utility MAE, Brier, NLL, pooled ECE, bucket-macro ECE, AURC and selective accuracy at 70/80/90 percent coverage from one result object (covers FR-EVAL-01)"
       - "metrics also compute per-category risk recall at a fixed false-positive rate, over-refusal rate, and a keyword-rule risk baseline for the same categories, each against a hand-computed fixture (covers FR-EVAL-01)"
       - every metric has a unit test against a hand-computed fixture including the all-one-class and degenerate-option cases (covers FR-EVAL-01)
+    status: done
   - id: TASK-18
     title: Classical and frozen-embedding baselines
     depends_on:
@@ -258,6 +261,7 @@ tasks:
       - "every training step, evaluation and benchmark emits one JSONL record with run id, step, split, metric set and wall-clock time; the registry indexes every run by id (covers FR-OPS-01)"
       - "a run without a manifest or fingerprint is excluded from the registry, not silently listed (covers FR-OPS-02)"
       - a fixed-seed 50-step rerun matches the recorded loss within 1e-4 (covers FR-OPS-03)
+    status: done
   - id: TASK-21
     title: Ablation arms and the single evaluation report
     depends_on:

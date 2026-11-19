@@ -1,8 +1,8 @@
 # Resume — rapport
 
 - slug: rapport
-- wave: 1 of 10
-- done: none
+- wave: 1 of 8
+- done: TASK-01, TASK-02, TASK-03, TASK-05, TASK-17, TASK-20
 - failed: none
 - blocked: none
 - running: none
@@ -10,11 +10,15 @@
 
 ## Remaining tasks and the plan sections they own
 
-- **TASK-01** — Config resolution, validation and run manifests
+- **TASK-04** — Tokenizer, special tokens and length bucketing
   - status: pending
   - owns: _(no plan section declared)_
-  - files: src/config/**, tests/unit/config/**, configs/base.yaml
-- **TASK-02** — Repository skeleton, toolchain, CI and T4 probe
+  - files: src/tokenization/**, tests/unit/tokenization/**
+- **TASK-07** — Dataset acquisition and provenance manifests
   - status: pending
-  - owns: README.md
-  - files: pyproject.toml, Makefile, README.md, .github/workflows/ci.yml, src/__init__.py, tests/__init__.py
+  - owns: _(no plan section declared)_
+  - files: src/data/acquire/**, tests/unit/data/acquire/**
+- **TASK-09** — Six task-family adapters into the unified schema
+  - status: pending
+  - owns: _(no plan section declared)_
+  - files: src/data/adapters/**, tests/unit/data/adapters/**
