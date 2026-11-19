@@ -169,6 +169,7 @@ tasks:
       - "a non-finite gradient skips the optimizer step, increments a counter, and does not advance the step count (covers E5) (covers FR-TRAIN-04)"
       - a checkpoint whose file hash mismatches is rejected with a typed error and is never loaded (covers E6)
       - "model, optimizer, scaler and scheduler state round-trip through save and load with byte-equal top tensors (covers FR-TRAIN-02)"
+    status: done
   - id: TASK-13
     title: Declarative mixtures and experiment configs
     depends_on:
@@ -181,6 +182,7 @@ tasks:
       - the declarative mixture reproduces an identical example order from the recorded fingerprint for a fixed seed (covers FR-DATA-07)
       - the 55k starter and the 115.6k full mixture reproduce the counts in docs/dataset-strategy.md within 1 percent (covers FR-DATA-07)
       - "configs/experiments contains one YAML per ablation arm A1 to A8 declared in docs/evaluation.md (each naming its init, seed set and data fingerprint) plus configs/experiments/starter.yaml (the 55k run) and configs/experiments/acceptance.yaml (the 115.6k run, whose config records the withheld OOD source UltraFeedback-binarized and the Y2 comparator)"
+    status: done
   - id: TASK-14
     title: Adaptive multi-task weighting and per-task logging
     depends_on:
@@ -244,6 +246,7 @@ tasks:
     acceptance:
       - "majority-class, TF-IDF logistic regression and frozen-embedding cosine baselines run from the same split manifest as the model and emit metrics in the same schema (covers FR-EVAL-02)"
       - "the TF-IDF baseline is a hard gate: the report marks Y1 fail for RAPPORT-C below the baseline by 8 points in-distribution (covers FR-EVAL-02)"
+    status: done
   - id: TASK-19
     title: "Robustness harness: permutation, option-count sweep, held-out source"
     depends_on:
@@ -258,6 +261,7 @@ tasks:
       - "the option-count sweep reports accuracy and bucket ECE for n in 2..8, and the held-out-source block is computed only on sources with zero training rows (covers FR-EVAL-03)"
       - contradictory-context and missing-information cases report the change in abstention rate explicitly (covers FR-EVAL-03)
       - "the length sweep reports choice accuracy and bucket ECE at 512, 768 and 1024 tokens; a drop exceeding 2 points at 1024 is reported as a failure of the 1024 extension claim (covers FR-EVAL-03)"
+    status: running
   - id: TASK-20
     title: "Structured logging, run registry and reproducibility checks"
     depends_on:
@@ -303,6 +307,7 @@ tasks:
     acceptance:
       - "Predictor.predict returns DecisionResult with chosen_index, scores, probabilities, confidence, abstain, risk and the calibration temperature used; empty options or a missing state produce a typed error with no traceback (covers E1) (covers FR-INFER-01)"
       - "the output schema contains no free-text field, so no generated answer can leak into the result (covers FR-INFER-01)"
+    status: done
   - id: TASK-23
     title: ONNX export and INT8 dynamic quantization
     depends_on:
@@ -313,6 +318,7 @@ tasks:
     acceptance:
       - ONNX export matches PyTorch logits within 1e-3 on a fixed 64-row batch and the reference batch and tolerance are recorded in the manifest (covers FR-INFER-02)
       - "dynamic INT8 quantization is checked per head and accepted only if choice accuracy drops by at most 1 point, bucket-macro ECE rises by at most 0.02, the cosine score path stays in FP32, serialized INT8 size is at most 35 MB, and p95 CPU latency is at least 2x faster than the FP32 ONNX baseline; if any bound fails the INT8 artifact is refused and the FP16 artifact is retained (covers E9) (covers FR-INFER-02)"
+    status: done
   - id: TASK-24
     title: "Inference benchmarks: latency, throughput, memory and size"
     depends_on:

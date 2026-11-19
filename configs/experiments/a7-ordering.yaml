@@ -1,0 +1,40 @@
+# Ablation A7 — ordering (docs/evaluation.md §5).
+# Question: is the curriculum earning its complexity?
+# Pass condition: curriculum >= uniform by >= 1 point, else curriculum is dropped.
+# Curriculum (docs/dataset-strategy.md §5, docs/training-strategy.md §3.1):
+# epochs 1-2 easy->hard by the frozen-embedding cosine difficulty score
+# (baseline_correct == false first); epochs 3+ uniform order with hard examples
+# oversampled 1.5x. The uniform arm is the same data in hash order, no curriculum.
+# Verdicts (Y1–Y14) are produced by TASK-21's report command; this config
+# does not compute verdicts.
+arm: A7
+title: ordering
+question: is the curriculum earning its complexity?
+init: bge-small
+variant: compact           # ultra 6/320 | compact 12/384 (recommended) | large 16/448
+layers: 12
+hidden: 384
+readout: cosine
+weight_mode: learned
+head_only: false
+ordering: curriculum       # this arm; see header for the curriculum contract
+ordering_alternates: [uniform]
+mixture: starter           # 55k — ablations run on the starter; acceptance re-runs the winner
+mixture_rows: 55000
+seeds: [13, 29, 47]
+data_fingerprint: ""       # recorded at acquisition time from the split manifest; required key, placeholder value
+epochs: 8
+batch_size: 64
+lr: 3.0e-4
+head_lr: 1.0e-3
+weight_decay: 0.01
+warmup_ratio: 0.05
+schedule: cosine
+grad_clip: 1.0
+dropout: 0.1
+label_smoothing: 0.0
+optimizer: adamw
+fp16: true
+variants:
+  - {name: curriculum, ordering: curriculum}
+  - {name: uniform, ordering: uniform}

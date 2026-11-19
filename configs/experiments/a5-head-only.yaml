@@ -1,0 +1,38 @@
+# Ablation A5 — head-only vs full fine-tune (docs/evaluation.md §5).
+# Question: how much of the gain is the head vs the trunk?
+# Pass condition: full fine-tune >= head-only by >= 3 points; else revisit
+# initialization. B5 (frozen trunk + trained heads) is the baseline twin of
+# the head-only arm.
+# Verdicts (Y1–Y14) are produced by TASK-21's report command; this config
+# does not compute verdicts.
+arm: A5
+title: head-only
+question: how much does the trunk learn?
+init: bge-small
+variant: compact           # ultra 6/320 | compact 12/384 (recommended) | large 16/448
+layers: 12
+hidden: 384
+readout: cosine
+weight_mode: learned
+head_only: false           # default arm is the full fine-tune; head-only is the control
+head_only_alternates: [true]
+ordering: curriculum
+mixture: starter           # 55k — ablations run on the starter; acceptance re-runs the winner
+mixture_rows: 55000
+seeds: [13, 29, 47]
+data_fingerprint: ""       # recorded at acquisition time from the split manifest; required key, placeholder value
+epochs: 8
+batch_size: 64
+lr: 3.0e-4
+head_lr: 1.0e-3
+weight_decay: 0.01
+warmup_ratio: 0.05
+schedule: cosine
+grad_clip: 1.0
+dropout: 0.1
+label_smoothing: 0.0
+optimizer: adamw
+fp16: true
+variants:
+  - {name: full-finetune, head_only: false}
+  - {name: head-only, head_only: true}     # frozen trunk, trained heads (B5)

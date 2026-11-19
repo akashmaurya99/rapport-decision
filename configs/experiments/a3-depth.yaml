@@ -1,0 +1,39 @@
+# Ablation A3 — depth / capacity (docs/evaluation.md §5).
+# Question: what does capacity buy?
+# Pass condition: RAPPORT-C within 2 points of RAPPORT-L on held-out source;
+# else promote RAPPORT-L. Variants per docs/architecture-spec.md §3:
+# ultra = RAPPORT-U 6/320 (11.91M) · compact = RAPPORT-C 12/384 (33.46M, recommended)
+# · large = RAPPORT-L 16/448 (52.83M). Only the compact variant is Y11-eligible.
+# Verdicts (Y1–Y14) are produced by TASK-21's report command; this config
+# does not compute verdicts.
+arm: A3
+title: depth
+question: what does capacity buy?
+init: bge-small
+variant: compact           # default arm; alternatives below
+layers: 12
+hidden: 384
+readout: cosine
+weight_mode: learned
+head_only: false
+ordering: curriculum
+mixture: starter           # 55k — ablations run on the starter; acceptance re-runs the winner
+mixture_rows: 55000
+seeds: [13, 29, 47]
+data_fingerprint: ""       # recorded at acquisition time from the split manifest; required key, placeholder value
+epochs: 8
+batch_size: 64
+lr: 3.0e-4
+head_lr: 1.0e-3
+weight_decay: 0.01
+warmup_ratio: 0.05
+schedule: cosine
+grad_clip: 1.0
+dropout: 0.1
+label_smoothing: 0.0
+optimizer: adamw
+fp16: true
+variants:
+  - {name: ultra, variant: ultra, layers: 6, hidden: 320}
+  - {name: compact, variant: compact, layers: 12, hidden: 384}
+  - {name: large, variant: large, layers: 16, hidden: 448}

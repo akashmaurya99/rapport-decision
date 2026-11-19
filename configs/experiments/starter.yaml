@@ -1,0 +1,36 @@
+# RAPPORT starter run — Stage B on the 55k starter mixture
+# (docs/training-strategy.md §1; counts per docs/dataset-strategy.md §6).
+# The starter is the smoke-run scale: it validates the pipeline, the sampler
+# and the gates before the 115.6k acceptance run (configs/experiments/acceptance.yaml).
+# Verdicts (Y1–Y14) are produced by TASK-21's report command; this config
+# does not compute verdicts.
+arm: starter
+title: 55k starter run (Stage B)
+question: does the full pipeline train end to end at 55k scale?
+init: bge-small            # BAAI/bge-small-en-v1.5; heads random
+variant: compact           # RAPPORT-C — 12 layers x 384 hidden, 33.46M (Y11-eligible)
+layers: 12
+hidden: 384
+readout: cosine
+weight_mode: learned       # floor 0.05, cap 4.0
+head_only: false
+ordering: curriculum
+mixture: starter           # packaged preset, counts asserted within 1% of docs/dataset-strategy.md §6
+mixture_rows: 55000
+max_length: 512
+infer_max_length: 512
+seeds: [13, 29, 47]
+data_fingerprint: ""       # recorded at acquisition time from the split manifest; required key, placeholder value
+epochs: 8                  # early stop on dev loss, patience 2
+batch_size: 64
+lr: 3.0e-4                 # encoder LR; head LR below
+head_lr: 1.0e-3
+weight_decay: 0.01
+warmup_ratio: 0.05
+schedule: cosine
+grad_clip: 1.0
+dropout: 0.1
+label_smoothing: 0.0
+optimizer: adamw
+fp16: true
+teacher: Qwen/Qwen3-1.7B   # Stage C reference; not used by this run

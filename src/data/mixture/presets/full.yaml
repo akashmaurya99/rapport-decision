@@ -1,0 +1,29 @@
+# 115.6k full mixture — docs/dataset-strategy.md §6 ("Final recommended mixture").
+# preference 33,000 (HH-RLHF 23,000 + HelpSteer2 10,000) · choice 30,000
+# (cais/mmlu auxiliary_train) · risk 18,000 (Aegis 2.0) · abstention 12,000
+# (AbstentionBench-derived) · probability 11,600 (TruthfulQA 1,600 +
+# auxiliary_train-derived binary 10,000) · scoring 11,000 (HelpSteer2)
+# = 115,600.
+#
+# UltraFeedback-binarized is the designated source-held-out OOD set and
+# contributes ZERO rows here; XSTest is evaluation-only (encoded only in the
+# experiment configs' evaluation block, never trained on).
+#
+# `fingerprint` is deliberately "" while the split-manifest fingerprint is
+# unresolved (recorded at acquisition time); load with
+# `load_preset("full")` and pass the recorded fingerprint to `sample()`.
+# Source labels are declarative ids resolved at acquisition time; the
+# admission/license record lives in the acquisition manifest, not here.
+name: full
+fingerprint: ""
+families:
+  preference:
+    - {source: "Anthropic/hh-rlhf", rows: 23000}
+    - {source: "nvidia/HelpSteer2", rows: 10000}
+  choice: {source: "cais/mmlu#auxiliary_train", rows: 30000}
+  risk: {source: "nvidia/Aegis-AI-Content-Safety-Dataset-2.0", rows: 18000}
+  abstention: {source: "AbstentionBench-derived", rows: 12000}
+  probability:
+    - {source: "truthfulqa/truthful_qa", rows: 1600}
+    - {source: "cais/mmlu#auxiliary_train-derived-binary", rows: 10000}
+  scoring: {source: "nvidia/HelpSteer2", rows: 11000}

@@ -1,0 +1,39 @@
+# Ablation A1 — initialization (docs/evaluation.md §5).
+# Question: does pretraining help at 55k?
+# Pass condition: bge-small >= random by >= 3 points; else the claim is reported
+# as unsupported. Controls per docs/training-strategy.md §2 (random init, and
+# all-MiniLM-L6-v2 22.7M).
+# Verdicts (Y1–Y14) are produced by TASK-21's report command; this config
+# does not compute verdicts.
+arm: A1
+title: init
+question: does pretraining help at 55k?
+init: bge-small            # BAAI/bge-small-en-v1.5, 33.4M, MIT; trunk loaded, heads random
+init_alternates: [random, all-MiniLM-L6-v2]   # "MiniLM-L6" of docs/evaluation.md §5
+variant: compact           # ultra 6/320 | compact 12/384 (recommended) | large 16/448
+layers: 12
+hidden: 384
+readout: cosine            # default readout until A2 evidence says otherwise
+weight_mode: learned       # Kendall-style s_t, floor 0.05, cap 4.0 (A4)
+head_only: false           # full fine-tune until A5 evidence says otherwise
+ordering: curriculum       # epochs 1-2 easy->hard, epochs 3+ uniform, hard oversampled 1.5x (A7)
+mixture: starter           # 55k — the arm question is explicitly "at 55k"
+mixture_rows: 55000
+seeds: [13, 29, 47]
+data_fingerprint: ""       # recorded at acquisition time from the split manifest; required key, placeholder value
+epochs: 8                  # early stop on dev loss, patience 2 (docs/training-strategy.md §3.1)
+batch_size: 64
+lr: 3.0e-4                 # encoder LR; range searched 1e-4 – 5e-4
+head_lr: 1.0e-3            # head LR; range searched 3e-4 – 2e-3
+weight_decay: 0.01         # excluded on norms, biases and embeddings
+warmup_ratio: 0.05         # linear warmup then cosine to 1e-5
+schedule: cosine
+grad_clip: 1.0
+dropout: 0.1                # hidden states and attention
+label_smoothing: 0.0       # deliberate: calibration is a first-class deliverable
+optimizer: adamw           # betas 0.9 / 0.98, eps 1e-8
+fp16: true
+variants:
+  - {name: bge-small, init: bge-small}
+  - {name: random, init: random}
+  - {name: minilm-l6, init: all-MiniLM-L6-v2}

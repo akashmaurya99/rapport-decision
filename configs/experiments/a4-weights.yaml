@@ -1,0 +1,40 @@
+# Ablation A4 — task weighting (docs/evaluation.md §5).
+# Question: does uncertainty weighting collapse a task?
+# Pass condition: no task collapsed below the floor (0.05) for 2 consecutive
+# epochs (WEIGHT_COLLAPSE). Arms: learned (Kendall et al. 2018, floor 0.05 cap
+# 4.0) | fixed (uniform 1.0) | uniform (equal weight, loss-normalised).
+# Verdicts (Y1–Y14) are produced by TASK-21's report command; this config
+# does not compute verdicts.
+arm: A4
+title: weights
+question: does uncertainty weighting collapse a task?
+init: bge-small
+variant: compact           # ultra 6/320 | compact 12/384 (recommended) | large 16/448
+layers: 12
+hidden: 384
+readout: cosine
+weight_mode: learned       # this arm; floor 0.05, cap 4.0 (docs/training-strategy.md §3.2)
+weight_floor: 0.05
+weight_cap: 4.0
+head_only: false
+ordering: curriculum
+mixture: starter           # 55k — ablations run on the starter; acceptance re-runs the winner
+mixture_rows: 55000
+seeds: [13, 29, 47]
+data_fingerprint: ""       # recorded at acquisition time from the split manifest; required key, placeholder value
+epochs: 8
+batch_size: 64
+lr: 3.0e-4
+head_lr: 1.0e-3
+weight_decay: 0.01
+warmup_ratio: 0.05
+schedule: cosine
+grad_clip: 1.0
+dropout: 0.1
+label_smoothing: 0.0
+optimizer: adamw
+fp16: true
+variants:
+  - {name: learned, weight_mode: learned}
+  - {name: fixed, weight_mode: fixed}     # fixed weights as per docs/training-strategy.md §3.2 defaults
+  - {name: uniform, weight_mode: uniform} # uniform across tasks
