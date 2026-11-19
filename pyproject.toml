@@ -1,0 +1,50 @@
+# Packaging for RAPPORT. Keep `version` in sync with `src/rapport/__init__.py`.
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rapport"
+version = "0.1.0"
+description = "RAPPORT — a compact, non-autoregressive decision model"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "torch",
+  "transformers",
+  "datasets",
+  "onnx",
+  "onnxruntime",
+  "scikit-learn",
+  "pyyaml",
+  "tqdm",
+  "psutil",
+  "numpy",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest",
+  "ruff",
+  "mypy",
+]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

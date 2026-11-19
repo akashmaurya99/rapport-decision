@@ -23,6 +23,6 @@ Rules of the road:
 <!-- archgen:features:start -->
 | Feature | Status | Updated |
 | --- | --- | --- |
-| rapport | planned | 2026-11-19 |
+| rapport | in progress | 2026-11-19 |
 <!-- archgen:features:end -->
 <!-- archgen:end -->

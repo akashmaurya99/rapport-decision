@@ -3,233 +3,333 @@
 # comment lines are preserved by archgen_tasks{set_status}
 # Every VALUE is QUOTED. All globs repo-root-relative and disjoint.
 tasks:
-  - id: "TASK-01"
+  - id: TASK-01
     title: "Config resolution, validation and run manifests"
     depends_on: []
-    file_ownership: ["src/config/**", "tests/unit/config/**", "configs/base.yaml"]
-    artifacts: ["configs/base.yaml"]
+    file_ownership:
+      - src/config/**
+      - tests/unit/config/**
+      - configs/base.yaml
+    artifacts:
+      - configs/base.yaml
     acceptance:
-      - "load_config resolves a YAML config plus RAPPORT_* environment overrides and fails with a typed error naming the unknown key (covers FR-CONFIG-01)"
+      - load_config resolves a YAML config plus RAPPORT_* environment overrides and fails with a typed error naming the unknown key (covers FR-CONFIG-01)
       - "a run manifest is written for every run and records git sha, config hash, data fingerprint, seed, device and the versions of python, torch, transformers and datasets (covers FR-CONFIG-02)"
       - "seeds are set for random, numpy, torch and CUDA, and the resolved determinism mode is readable from the manifest (covers FR-CONFIG-03)"
-
-  - id: "TASK-02"
+    status: done
+  - id: TASK-02
     title: "Repository skeleton, toolchain, CI and T4 probe"
     depends_on: []
-    file_ownership: ["pyproject.toml", "Makefile", "README.md", ".github/workflows/ci.yml", "src/__init__.py", "tests/__init__.py"]
-    artifacts: ["README.md"]
+    file_ownership:
+      - pyproject.toml
+      - Makefile
+      - README.md
+      - ".github/workflows/ci.yml"
+      - src/__init__.py
+      - tests/__init__.py
+    artifacts:
+      - README.md
     acceptance:
       - "pip install -e . succeeds and python -c 'import rapport; print(rapport.__version__)' prints a version"
       - "ruff check . and mypy src both exit 0, and the CI workflow runs lint, typecheck and pytest on push"
       - "the T4 probe prints compute capability, VRAM and available SDPA backends, and the resolved values are written to the run manifest (covers FR-CONFIG-02)"
-
-  - id: "TASK-03"
-    title: "DecisionExample contract and normalization"
-    depends_on: ["TASK-01"]
-    file_ownership: ["src/data/core/**", "tests/unit/data/core/**"]
+    status: done
+  - id: TASK-03
+    title: DecisionExample contract and normalization
+    depends_on:
+      - TASK-01
+    file_ownership:
+      - src/data/core/**
+      - tests/unit/data/core/**
     acceptance:
       - "normalize_example rejects an empty goal, fewer than two options, a duplicate option after normalization, and an out-of-range chosen index, each with a distinct typed error code (covers E3) (covers FR-DATA-01)"
       - "example_id is order-invariant: permuting options leaves the sha256 unchanged, and a fixture round-trips through parse, validate and serialize with an identical hash"
       - "normalization applies Unicode NFC, strips HTML and collapses whitespace, and records nothing that a source did not provide"
-
-  - id: "TASK-04"
+  - id: TASK-04
     title: "Tokenizer, special tokens and length bucketing"
-    depends_on: ["TASK-01", "TASK-02", "TASK-03"]
-    file_ownership: ["src/tokenization/**", "tests/unit/tokenization/**"]
+    depends_on:
+      - TASK-01
+      - TASK-02
+      - TASK-03
+    file_ownership:
+      - src/tokenization/**
+      - tests/unit/tokenization/**
     acceptance:
       - "the special tokens <task>, <goal>, <state>, <opt> and </opt> are added and round-trip with every marker boundary intact (covers FR-TOK-01)"
       - "encode_example respects the 512-token budget and truncates long states from the end, writing a truncation flag on the example and a per-source count in the manifest (covers FR-TOK-02)"
       - "length bucketing produces at most three distinct batch shapes across 10,000 examples from the starter fixture (covers FR-TOK-02)"
-
-  - id: "TASK-05"
-    title: "Encoder trunk and parameter accounting"
-    depends_on: ["TASK-01", "TASK-02"]
-    file_ownership: ["src/model/core/**", "tests/unit/model/core/**"]
+  - id: TASK-05
+    title: Encoder trunk and parameter accounting
+    depends_on:
+      - TASK-01
+      - TASK-02
+    file_ownership:
+      - src/model/core/**
+      - tests/unit/model/core/**
     acceptance:
-      - "RapportConfig renders the layer table in docs/architecture-spec.md and count_parameters reports each component within 1 percent of it; the RAPPORT-C trunk is 21.24M parameters (covers FR-MODEL-01)"
+      - RapportConfig renders the layer table in docs/architecture-spec.md and count_parameters reports each component within 1 percent of it; the RAPPORT-C trunk is 21.24M parameters (covers FR-MODEL-01)
       - "the trunk emits [B, 512, 384] for a fixed batch and RoPE with base 10000 is the only position mechanism in the implementation"
-      - "the counter fails the build when the implementation and the spec disagree by more than 1 percent (covers FR-MODEL-01)"
-
-  - id: "TASK-06"
+      - the counter fails the build when the implementation and the spec disagree by more than 1 percent (covers FR-MODEL-01)
+  - id: TASK-06
     title: "Marker readout, six heads and model assembly"
-    depends_on: ["TASK-05", "TASK-04"]
-    file_ownership: ["src/model/head/**", "tests/unit/model/head/**"]
-    artifacts: ["src/model/head/model.py"]
+    depends_on:
+      - TASK-05
+      - TASK-04
+    file_ownership:
+      - src/model/head/**
+      - tests/unit/model/head/**
+    artifacts:
+      - src/model/head/model.py
     acceptance:
       - "for batch sizes 1, 32 and n options in 2..8 the forward pass returns exactly n scores per example, and n of 1 or 9 is refused by input validation with a typed error (covers E2) (covers FR-MODEL-04)"
       - "permuting the options permutes the scores by the same permutation within 1e-4, and no ordinal embedding or order-dependent path exists in the option markers (covers FR-MODEL-02)"
       - "all six heads return the shapes declared in docs/architecture-spec.md §4 and docs/prd.md FR-MODEL-03: choice_logits[n], scores[n], probability[1], confidence[1], answerable[1], risk[8] (covers FR-MODEL-03)"
       - "a single forward pass encodes the state and all options jointly, with no per-option forward pass in the default path (covers FR-MODEL-04)"
-
-  - id: "TASK-07"
-    title: "Dataset acquisition and provenance manifests"
-    depends_on: ["TASK-01", "TASK-03"]
-    file_ownership: ["src/data/acquire/**", "tests/unit/data/acquire/**"]
+  - id: TASK-07
+    title: Dataset acquisition and provenance manifests
+    depends_on:
+      - TASK-01
+      - TASK-03
+    file_ownership:
+      - src/data/acquire/**
+      - tests/unit/data/acquire/**
     acceptance:
       - "every source writes a manifest with license, declared and observed row counts, sha256 and acquisition date; a source with no license is marked quarantine and the mixture refuses it (covers FR-DATA-02)"
-      - "no corpus over 200 MB is materialized on disk; acquisition uses streaming and writes filtered parquet shards"
+      - no corpus over 200 MB is materialized on disk; acquisition uses streaming and writes filtered parquet shards
       - "acquisition is idempotent: a re-run verifies existing shards by hash and skips re-downloading them"
-
-  - id: "TASK-08"
+  - id: TASK-08
     title: "Deduplication, quality filtering and contradiction audit"
-    depends_on: ["TASK-03", "TASK-07"]
-    file_ownership: ["src/data/clean/**", "tests/unit/data/clean/**"]
+    depends_on:
+      - TASK-03
+      - TASK-07
+    file_ownership:
+      - src/data/clean/**
+      - tests/unit/data/clean/**
     acceptance:
-      - "exact dedup removes byte-identical normalized rows and reports per-source counts; near-dedup removes near-duplicates at Jaccard at least 0.9 and records the threshold (covers FR-DATA-03)"
-      - "rules Q1 to Q6 each increment a named counter and the rejection report sums to the removed rows; no rule deletes a hard example for being hard (covers FR-DATA-04)"
-      - "groups with contradictory gold labels are moved to a contested file with their count reported and no label is silently chosen"
-
-  - id: "TASK-09"
-    title: "Six task-family adapters into the unified schema"
-    depends_on: ["TASK-03"]
-    file_ownership: ["src/data/adapters/**", "tests/unit/data/adapters/**"]
+      - exact dedup removes byte-identical normalized rows and reports per-source counts; near-dedup removes near-duplicates at Jaccard at least 0.9 and records the threshold (covers FR-DATA-03)
+      - rules Q1 to Q6 each increment a named counter and the rejection report sums to the removed rows; no rule deletes a hard example for being hard (covers FR-DATA-04)
+      - groups with contradictory gold labels are moved to a contested file with their count reported and no label is silently chosen
+  - id: TASK-09
+    title: Six task-family adapters into the unified schema
+    depends_on:
+      - TASK-03
+    file_ownership:
+      - src/data/adapters/**
+      - tests/unit/data/adapters/**
     acceptance:
       - "the six adapters map choice, preference, scoring, probability, abstention and risk sources into DecisionExample with source, task_family and group_id set; the MMLU-Pro adapter reports the 10-to-8 option reduction with its seed, the probability adapter derives its binary rows from auxiliary_train by formula and reports the derived count, and the AbstentionBench adapter reports per-subset conversion rates (covers FR-DATA-05)"
       - "an unmappable record is counted and rejected with a typed reason, never silently skipped"
-      - "option order is shuffled at ingest with a recorded seed and the original order is retained for reconstruction"
-
-  - id: "TASK-10"
+      - option order is shuffled at ingest with a recorded seed and the original order is retained for reconstruction
+  - id: TASK-10
     title: "Deterministic group-aware splits, leakage checks and fingerprints"
-    depends_on: ["TASK-08", "TASK-09"]
-    file_ownership: ["src/data/splits/**", "tests/unit/data/splits/**"]
+    depends_on:
+      - TASK-08
+      - TASK-09
+    file_ownership:
+      - src/data/splits/**
+      - tests/unit/data/splits/**
     acceptance:
-      - "splitting by group_id into 70/15/15 leaves no group in two splits; the assertion fails the build otherwise (covers FR-DATA-06)"
+      - splitting by group_id into 70/15/15 leaves no group in two splits; the assertion fails the build otherwise (covers FR-DATA-06)
       - "the split manifest records the fingerprint, counts per family per split, the dedup threshold, a group_overlap of zero and the required ood_source field naming the withheld UltraFeedback-binarized; any positive overlap is a fatal error (covers E4)"
       - "one entire source is withheld for the OOD test and contributes zero rows to train and dev, and its identity is recorded in the manifest"
-
-  - id: "TASK-11"
-    title: "Multi-task loss functions"
-    depends_on: ["TASK-01", "TASK-06"]
-    file_ownership: ["src/training/losses.py", "tests/unit/training/test_losses.py"]
+  - id: TASK-11
+    title: Multi-task loss functions
+    depends_on:
+      - TASK-01
+      - TASK-06
+    file_ownership:
+      - src/training/losses.py
+      - tests/unit/training/test_losses.py
     acceptance:
       - "every loss matches a hand-computed value within 1e-5 on a fixed fixture, including the masked and empty-pair cases (covers FR-TRAIN-01)"
-      - "the abstention loss is masked when answerable is unset and the risk loss is masked when no risk labels are present"
-      - "a non-finite loss surfaces a typed exception and never reaches the optimizer"
-
-  - id: "TASK-12"
-    title: "FP16 trainer core with checkpoint and resume"
-    depends_on: ["TASK-05", "TASK-06", "TASK-11", "TASK-13", "TASK-20"]
-    file_ownership: ["src/training/core/**", "tests/unit/training/core/**"]
+      - the abstention loss is masked when answerable is unset and the risk loss is masked when no risk labels are present
+      - a non-finite loss surfaces a typed exception and never reaches the optimizer
+  - id: TASK-12
+    title: FP16 trainer core with checkpoint and resume
+    depends_on:
+      - TASK-05
+      - TASK-06
+      - TASK-11
+      - TASK-13
+      - TASK-20
+    file_ownership:
+      - src/training/core/**
+      - tests/unit/training/core/**
     acceptance:
       - "the trainer writes a checkpoint every 500 steps and at epoch end, preserves the sampler offset, and resumes to the same loss trajectory (covers FR-TRAIN-02)"
       - "a non-finite gradient skips the optimizer step, increments a counter, and does not advance the step count (covers E5) (covers FR-TRAIN-04)"
-      - "a checkpoint whose file hash mismatches is rejected with a typed error and is never loaded (covers E6)"
+      - a checkpoint whose file hash mismatches is rejected with a typed error and is never loaded (covers E6)
       - "model, optimizer, scaler and scheduler state round-trip through save and load with byte-equal top tensors (covers FR-TRAIN-02)"
-
-  - id: "TASK-13"
-    title: "Declarative mixtures and experiment configs"
-    depends_on: ["TASK-10"]
-    file_ownership: ["src/data/mixture/**", "tests/unit/data/mixture/**", "configs/experiments/**"]
+  - id: TASK-13
+    title: Declarative mixtures and experiment configs
+    depends_on:
+      - TASK-10
+    file_ownership:
+      - src/data/mixture/**
+      - tests/unit/data/mixture/**
+      - configs/experiments/**
     acceptance:
-      - "the declarative mixture reproduces an identical example order from the recorded fingerprint for a fixed seed (covers FR-DATA-07)"
-      - "the 55k starter and the 115.6k full mixture reproduce the counts in docs/dataset-strategy.md within 1 percent (covers FR-DATA-07)"
+      - the declarative mixture reproduces an identical example order from the recorded fingerprint for a fixed seed (covers FR-DATA-07)
+      - the 55k starter and the 115.6k full mixture reproduce the counts in docs/dataset-strategy.md within 1 percent (covers FR-DATA-07)
       - "configs/experiments contains one YAML per ablation arm A1 to A8 declared in docs/evaluation.md (each naming its init, seed set and data fingerprint) plus configs/experiments/starter.yaml (the 55k run) and configs/experiments/acceptance.yaml (the 115.6k run, whose config records the withheld OOD source UltraFeedback-binarized and the Y2 comparator)"
-
-  - id: "TASK-14"
-    title: "Adaptive multi-task weighting and per-task logging"
-    depends_on: ["TASK-12", "TASK-11", "TASK-20"]
-    file_ownership: ["src/training/multitask/**", "tests/unit/training/multitask/**"]
+  - id: TASK-14
+    title: Adaptive multi-task weighting and per-task logging
+    depends_on:
+      - TASK-12
+      - TASK-11
+      - TASK-20
+    file_ownership:
+      - src/training/multitask/**
+      - tests/unit/training/multitask/**
     acceptance:
       - "learned task weights are bounded by a floor of 0.05 and a cap of 4.0, logged every epoch, and a task at the floor for two consecutive epochs is surfaced as a WEIGHT_COLLAPSE event (covers FR-TRAIN-03)"
-      - "the resolved per-task weight vector is written to the manifest and to the run registry (covers FR-TRAIN-03)"
-      - "a fixed-weight arm is registered for ablation A4"
-
-  - id: "TASK-15"
-    title: "Local-teacher soft-label distillation and its gate"
-    depends_on: ["TASK-06", "TASK-12", "TASK-13"]
-    file_ownership: ["src/distill/**", "tests/unit/distill/**"]
+      - the resolved per-task weight vector is written to the manifest and to the run registry (covers FR-TRAIN-03)
+      - a fixed-weight arm is registered for ablation A4
+  - id: TASK-15
+    title: Local-teacher soft-label distillation and its gate
+    depends_on:
+      - TASK-06
+      - TASK-12
+      - TASK-13
+    file_ownership:
+      - src/distill/**
+      - tests/unit/distill/**
     acceptance:
       - "soft labels are cached by teacher_id, template_hash and example_id; a second invocation performs zero teacher forwards and reaches 100 percent cache hits (covers FR-DISTILL-01)"
       - "the distillation gate aborts and records a negative result when the teacher fails to load or scores below the supervised student by 3 points on dev, or the KD student is not at least 1 point above it (covers E8) (covers FR-DISTILL-02)"
-      - "the teacher runs locally inside the runtime and no network call is made beyond its one-time download (covers FR-DISTILL-01)"
-
-  - id: "TASK-16"
-    title: "Per-bucket calibration and the abstention policy"
-    depends_on: ["TASK-06"]
-    file_ownership: ["src/calibration/**", "tests/unit/calibration/**"]
+      - the teacher runs locally inside the runtime and no network call is made beyond its one-time download (covers FR-DISTILL-01)
+  - id: TASK-16
+    title: Per-bucket calibration and the abstention policy
+    depends_on:
+      - TASK-06
+    file_ownership:
+      - src/calibration/**
+      - tests/unit/calibration/**
     acceptance:
       - "per-bucket temperatures are fitted by 5-fold group-aware cross-fitting on dev logits with an NLL grid search, and every bucket stores its item count; a bucket with 50-200 items uses Platt scaling instead of a single temperature, and a bucket below 50 items inherits the pooled temperature and is flagged (covers FR-CALIB-01)"
       - "per-category risk thresholds are fitted on dev to hold false-positive rate at most 0.10 on the dev safe rows drawn from Aegis safe-labeled prompts, frozen into the calibration map before test is read; the XSTest safe set is never used for fitting and remains the Y8 measurement set (covers FR-CALIB-03)"
-      - "the calibration module computes its own pooled ECE and bucket-macro ECE plus Brier score and NLL and does not depend on the evaluation module (covers FR-CALIB-02)"
-      - "the abstention threshold derives from the declared utility triple and emits a risk-coverage curve; the default triple yields a threshold of 0.75 (covers FR-CALIB-03)"
-
-  - id: "TASK-17"
-    title: "Metrics implementation"
-    depends_on: ["TASK-01"]
-    file_ownership: ["src/evaluation/metrics.py", "tests/unit/evaluation/test_metrics.py"]
+      - the calibration module computes its own pooled ECE and bucket-macro ECE plus Brier score and NLL and does not depend on the evaluation module (covers FR-CALIB-02)
+      - the abstention threshold derives from the declared utility triple and emits a risk-coverage curve; the default triple yields a threshold of 0.75 (covers FR-CALIB-03)
+  - id: TASK-17
+    title: Metrics implementation
+    depends_on:
+      - TASK-01
+    file_ownership:
+      - src/evaluation/metrics.py
+      - tests/unit/evaluation/test_metrics.py
     acceptance:
       - "metrics compute accuracy, macro-F1, NDCG@k, Spearman, Pearson, utility MAE, Brier, NLL, pooled ECE, bucket-macro ECE, AURC and selective accuracy at 70/80/90 percent coverage from one result object (covers FR-EVAL-01)"
       - "metrics also compute per-category risk recall at a fixed false-positive rate, over-refusal rate, and a keyword-rule risk baseline for the same categories, each against a hand-computed fixture (covers FR-EVAL-01)"
-      - "every metric has a unit test against a hand-computed fixture including the all-one-class and degenerate-option cases (covers FR-EVAL-01)"
-
-  - id: "TASK-18"
-    title: "Classical and frozen-embedding baselines"
-    depends_on: ["TASK-09", "TASK-13", "TASK-17"]
-    file_ownership: ["src/evaluation/baselines.py", "tests/unit/evaluation/test_baselines.py"]
+      - every metric has a unit test against a hand-computed fixture including the all-one-class and degenerate-option cases (covers FR-EVAL-01)
+  - id: TASK-18
+    title: Classical and frozen-embedding baselines
+    depends_on:
+      - TASK-09
+      - TASK-13
+      - TASK-17
+    file_ownership:
+      - src/evaluation/baselines.py
+      - tests/unit/evaluation/test_baselines.py
     acceptance:
       - "majority-class, TF-IDF logistic regression and frozen-embedding cosine baselines run from the same split manifest as the model and emit metrics in the same schema (covers FR-EVAL-02)"
       - "the TF-IDF baseline is a hard gate: the report marks Y1 fail for RAPPORT-C below the baseline by 8 points in-distribution (covers FR-EVAL-02)"
-
-  - id: "TASK-19"
+  - id: TASK-19
     title: "Robustness harness: permutation, option-count sweep, held-out source"
-    depends_on: ["TASK-06", "TASK-10", "TASK-17"]
-    file_ownership: ["src/evaluation/robustness.py", "tests/unit/evaluation/test_robustness.py"]
+    depends_on:
+      - TASK-06
+      - TASK-10
+      - TASK-17
+    file_ownership:
+      - src/evaluation/robustness.py
+      - tests/unit/evaluation/test_robustness.py
     acceptance:
       - "permutation tests enumerate all n! for n at most 4 and eight sampled permutations otherwise, and report accuracy delta and per-score max deviation within 1e-4 (covers E7)"
       - "the option-count sweep reports accuracy and bucket ECE for n in 2..8, and the held-out-source block is computed only on sources with zero training rows (covers FR-EVAL-03)"
-      - "contradictory-context and missing-information cases report the change in abstention rate explicitly (covers FR-EVAL-03)"
+      - contradictory-context and missing-information cases report the change in abstention rate explicitly (covers FR-EVAL-03)
       - "the length sweep reports choice accuracy and bucket ECE at 512, 768 and 1024 tokens; a drop exceeding 2 points at 1024 is reported as a failure of the 1024 extension claim (covers FR-EVAL-03)"
-
-  - id: "TASK-20"
+  - id: TASK-20
     title: "Structured logging, run registry and reproducibility checks"
-    depends_on: ["TASK-01"]
-    file_ownership: ["src/ops/**", "tests/unit/ops/**"]
+    depends_on:
+      - TASK-01
+    file_ownership:
+      - src/ops/**
+      - tests/unit/ops/**
     acceptance:
       - "every training step, evaluation and benchmark emits one JSONL record with run id, step, split, metric set and wall-clock time; the registry indexes every run by id (covers FR-OPS-01)"
       - "a run without a manifest or fingerprint is excluded from the registry, not silently listed (covers FR-OPS-02)"
-      - "a fixed-seed 50-step rerun matches the recorded loss within 1e-4 (covers FR-OPS-03)"
-
-  - id: "TASK-21"
-    title: "Ablation arms and the single evaluation report"
-    depends_on: ["TASK-13", "TASK-14", "TASK-16", "TASK-18", "TASK-19", "TASK-20"]
-    file_ownership: ["src/evaluation/ablate.py", "src/evaluation/report.py", "tests/unit/evaluation/test_ablate.py", "tests/unit/evaluation/test_report.py"]
-    artifacts: ["src/evaluation/report.py"]
+      - a fixed-seed 50-step rerun matches the recorded loss within 1e-4 (covers FR-OPS-03)
+  - id: TASK-21
+    title: Ablation arms and the single evaluation report
+    depends_on:
+      - TASK-13
+      - TASK-14
+      - TASK-16
+      - TASK-18
+      - TASK-19
+      - TASK-20
+    file_ownership:
+      - src/evaluation/ablate.py
+      - src/evaluation/report.py
+      - tests/unit/evaluation/test_ablate.py
+      - tests/unit/evaluation/test_report.py
+    artifacts:
+      - src/evaluation/report.py
     acceptance:
       - "the report renders arms A1 to A8 and verdicts Y1 to Y14 as pass, fail or not-measured, includes failed arms, and the negative results section is never empty (covers FR-EVAL-04)"
       - "metrics are printed per family, per split, with seeds 13, 29 and 47, and a claim is printed only when the mean gap exceeds one seed standard deviation (covers FR-EVAL-05)"
       - "the report renders Y7 and Y8 verdicts (per-category risk recall at FPR at most 0.10 on the held-out Aegis rows with the keyword-rule baseline as comparator; over-refusal rate on the XSTest safe set), and refuses to print a pass when either input is missing (covers FR-EVAL-05)"
-      - "any blocking criterion with a fail verdict makes the report command exit non-zero (covers FR-EVAL-05)"
-
-  - id: "TASK-22"
-    title: "The DecisionResult prediction API"
-    depends_on: ["TASK-06", "TASK-04", "TASK-16"]
-    file_ownership: ["src/inference/predictor.py", "tests/unit/inference/test_predictor.py"]
+      - any blocking criterion with a fail verdict makes the report command exit non-zero (covers FR-EVAL-05)
+  - id: TASK-22
+    title: The DecisionResult prediction API
+    depends_on:
+      - TASK-06
+      - TASK-04
+      - TASK-16
+    file_ownership:
+      - src/inference/predictor.py
+      - tests/unit/inference/test_predictor.py
     acceptance:
       - "Predictor.predict returns DecisionResult with chosen_index, scores, probabilities, confidence, abstain, risk and the calibration temperature used; empty options or a missing state produce a typed error with no traceback (covers E1) (covers FR-INFER-01)"
       - "the output schema contains no free-text field, so no generated answer can leak into the result (covers FR-INFER-01)"
-
-  - id: "TASK-23"
-    title: "ONNX export and INT8 dynamic quantization"
-    depends_on: ["TASK-22"]
-    file_ownership: ["src/inference/export.py", "tests/unit/inference/test_export.py"]
+  - id: TASK-23
+    title: ONNX export and INT8 dynamic quantization
+    depends_on:
+      - TASK-22
+    file_ownership:
+      - src/inference/export.py
+      - tests/unit/inference/test_export.py
     acceptance:
-      - "ONNX export matches PyTorch logits within 1e-3 on a fixed 64-row batch and the reference batch and tolerance are recorded in the manifest (covers FR-INFER-02)"
+      - ONNX export matches PyTorch logits within 1e-3 on a fixed 64-row batch and the reference batch and tolerance are recorded in the manifest (covers FR-INFER-02)
       - "dynamic INT8 quantization is checked per head and accepted only if choice accuracy drops by at most 1 point, bucket-macro ECE rises by at most 0.02, the cosine score path stays in FP32, serialized INT8 size is at most 35 MB, and p95 CPU latency is at least 2x faster than the FP32 ONNX baseline; if any bound fails the INT8 artifact is refused and the FP16 artifact is retained (covers E9) (covers FR-INFER-02)"
-
-  - id: "TASK-24"
+  - id: TASK-24
     title: "Inference benchmarks: latency, throughput, memory and size"
-    depends_on: ["TASK-22", "TASK-23", "TASK-20"]
-    file_ownership: ["src/inference/bench.py", "tests/unit/inference/test_bench.py"]
+    depends_on:
+      - TASK-22
+      - TASK-23
+      - TASK-20
+    file_ownership:
+      - src/inference/bench.py
+      - tests/unit/inference/test_bench.py
     acceptance:
       - "the benchmark warms up 50 passes, runs 1000 iterations, and reports p50, p95 and p99 for batch 1 and batch 32, plus batch-32 throughput, peak VRAM, peak RSS and serialized sizes for FP32, FP16 and INT8 (covers FR-INFER-03)"
       - "the report records GPU name, compute capability, driver, CUDA and torch versions, and flags any difference against an earlier run (covers FR-CONFIG-02)"
-
-  - id: "TASK-25"
-    title: "End-to-end acceptance run and report"
-    depends_on: ["TASK-12", "TASK-14", "TASK-15", "TASK-16", "TASK-21", "TASK-22", "TASK-23", "TASK-24"]
-    file_ownership: ["scripts/**", "tests/unit/scripts/**"]
-    artifacts: ["scripts/e2e.py"]
+  - id: TASK-25
+    title: End-to-end acceptance run and report
+    depends_on:
+      - TASK-12
+      - TASK-14
+      - TASK-15
+      - TASK-16
+      - TASK-21
+      - TASK-22
+      - TASK-23
+      - TASK-24
+    file_ownership:
+      - scripts/**
+      - tests/unit/scripts/**
+    artifacts:
+      - scripts/e2e.py
     acceptance:
-      - "scripts/e2e.py --config configs/experiments/acceptance.yaml --resume auto completes from a simulated mid-epoch kill and the resumed loss matches the uninterrupted run within 1e-4 (covers E10)"
+      - scripts/e2e.py --config configs/experiments/acceptance.yaml --resume auto completes from a simulated mid-epoch kill and the resumed loss matches the uninterrupted run within 1e-4 (covers E10)
       - "the acceptance run trains on the full 115.6k mixture, produces runs/<id>/report.md with every Y1 to Y14 verdict (Y2 included, computed on the OOD block from the withheld source), and exits non-zero when a blocking criterion fails (covers FR-EVAL-05)"
-      - "a 55k starter smoke path is available on the same command as documented --starter and is not part of the acceptance verdict"
+      - a 55k starter smoke path is available on the same command as documented --starter and is not part of the acceptance verdict
