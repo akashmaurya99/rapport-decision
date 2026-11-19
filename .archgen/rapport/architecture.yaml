@@ -1,0 +1,294 @@
+# schema_version: 1
+# generator: archgen v0.1.7
+# RAPPORT — architecture contract. This file is the anti-hallucination source of truth:
+# tasks cite these keys instead of restating shapes. Deep rationale lives in
+# docs/architecture-spec.md; this file carries the executable contract only.
+name: "rapport"
+slug: "rapport"
+
+toolchain:
+  language: "Python"
+  runtime: "CPython 3.11 with PyTorch 2.x on CUDA 12.1 (Colab Tesla T4, sm_75)"
+  package_manager: "pip with a pinned requirements file; editable install"
+  build: "pip install -e ."
+  test: "pytest -q"
+  lint: "ruff check ."
+  typecheck: "mypy src"
+  source_root: "src"
+  test_root: "tests/unit"
+
+existing_docs: []
+
+structure:
+  - path: "pyproject.toml"
+    purpose: "packaging, pinned extras and tool settings"
+  - path: "Makefile"
+    purpose: "one entry point per pipeline stage"
+  - path: "README.md"
+    purpose: "the only repository-level orientation document; points at .archgen/rapport"
+  - path: ".github/workflows/ci.yml"
+    purpose: "lint, typecheck and unit tests on push"
+  - path: "src/__init__.py"
+    purpose: "package marker and version"
+  - path: "src/config/**"
+    purpose: "config resolution, validation and run manifests"
+  - path: "configs/base.yaml"
+    purpose: "the base run config every experiment extends"
+  - path: "configs/experiments/**"
+    purpose: "one declarative config per experiment and ablation arm"
+  - path: "src/data/core/**"
+    purpose: "the DecisionExample contract and normalization"
+  - path: "src/data/acquire/**"
+    purpose: "source acquisition and provenance manifests"
+  - path: "src/data/clean/**"
+    purpose: "deduplication and named quality filters"
+  - path: "src/data/adapters/**"
+    purpose: "six task-family adapters into the unified schema"
+  - path: "src/data/splits/**"
+    purpose: "deterministic group-aware splits and leakage assertions"
+  - path: "src/data/mixture/**"
+    purpose: "declarative mixture sampling and order determinism"
+  - path: "src/tokenization/**"
+    purpose: "special tokens, encoding and length bucketing"
+  - path: "src/model/core/**"
+    purpose: "encoder trunk and parameter accounting"
+  - path: "src/model/head/**"
+    purpose: "marker readout, six heads and model assembly"
+  - path: "src/training/losses.py"
+    purpose: "the multi-task loss functions"
+  - path: "src/training/core/**"
+    purpose: "trainer loop, FP16 scaling, checkpoint and resume"
+  - path: "src/training/multitask/**"
+    purpose: "adaptive multi-task weighting and per-task logging"
+  - path: "src/distill/**"
+    purpose: "local teacher runner, soft-label cache and distillation gate"
+  - path: "src/calibration/**"
+    purpose: "per-bucket temperature maps, ECE and the abstention policy"
+  - path: "src/evaluation/metrics.py"
+    purpose: "all reported metrics"
+  - path: "src/evaluation/baselines.py"
+    purpose: "majority, TF-IDF logistic regression and frozen-embedding cosine"
+  - path: "src/evaluation/robustness.py"
+    purpose: "permutation, option-count and held-out-source harness"
+  - path: "src/evaluation/ablate.py"
+    purpose: "ablation arms"
+  - path: "src/evaluation/report.py"
+    purpose: "one report with every arm, seed and verdict"
+  - path: "src/inference/predictor.py"
+    purpose: "the DecisionResult API"
+  - path: "src/inference/export.py"
+    purpose: "ONNX export and INT8 quantization"
+  - path: "src/inference/bench.py"
+    purpose: "latency, throughput, memory and size benchmarks"
+  - path: "src/ops/**"
+    purpose: "JSONL logging, run registry and reproducibility checks"
+  - path: "scripts/**"
+    purpose: "end-to-end entry points including the acceptance run"
+
+naming_conventions:
+  file_naming: "snake_case module files; one purpose per module; no file above 1000 LOC"
+  dir_layout: "src/<module>/... for production code; utilities shared by two or more modules live in src/ops; tests mirror the source path under tests/unit"
+  symbol_casing: "snake_case functions and variables; PascalCase classes; SCREAMING_SNAKE_CASE constants"
+  test_placement: "the test tree is a SIBLING of the source tree; a source file src/<module>/<path>/<file>.py is mirrored at tests/unit/<module>/<path>/test_<file>.py"
+  config_naming: "configs/experiments/<experiment>[__<arm>].yaml; every key is snake_case"
+
+modules:
+  - name: "config"
+    responsibility: "resolve one config, apply env overrides, fail fast, and emit a run manifest"
+    owns: ["src/config/**", "tests/unit/config/**", "configs/base.yaml"]
+    depends_on_modules: []
+    key_interfaces:
+      - "load_config (src/config/loader.py)"
+      - "RunManifest (src/config/manifest.py)"
+
+  - name: "data"
+    responsibility: "turn licensed sources into validated, deduplicated, split, mixture-sampled DecisionExample rows"
+    owns: ["src/data/core/**", "src/data/acquire/**", "src/data/clean/**", "src/data/adapters/**", "src/data/splits/**", "src/data/mixture/**", "tests/unit/data/core/**", "tests/unit/data/acquire/**", "tests/unit/data/clean/**", "tests/unit/data/adapters/**", "tests/unit/data/splits/**", "tests/unit/data/mixture/**"]
+    depends_on_modules: ["config"]
+    key_interfaces:
+      - "DecisionExample (src/data/core/schema.py)"
+      - "normalize_example (src/data/core/normalize.py)"
+      - "build_split_manifest (src/data/splits/split.py)"
+      - "sample_mixture (src/data/mixture/sampler.py)"
+
+  - name: "tokenization"
+    responsibility: "special tokens, encoding and length bucketing"
+    owns: ["src/tokenization/**", "tests/unit/tokenization/**"]
+    depends_on_modules: ["config", "data"]
+    key_interfaces:
+      - "build_tokenizer (src/tokenization/tokenizer.py)"
+      - "encode_example (src/tokenization/encode.py)"
+
+  - name: "model"
+    responsibility: "encoder trunk, marker readout, six heads and parameter accounting"
+    owns: ["src/model/core/**", "src/model/head/**", "tests/unit/model/core/**", "tests/unit/model/head/**"]
+    depends_on_modules: ["config", "tokenization"]
+    key_interfaces:
+      - "RapportConfig (src/model/core/spec.py)"
+      - "count_parameters (src/model/core/spec.py)"
+      - "RapportModel (src/model/head/model.py)"
+
+  - name: "training"
+    responsibility: "losses, FP16 trainer with resume, and adaptive multi-task weighting"
+    owns: ["src/training/losses.py", "src/training/core/**", "src/training/multitask/**", "tests/unit/training/test_losses.py", "tests/unit/training/core/**", "tests/unit/training/multitask/**"]
+    depends_on_modules: ["config", "data", "model", "ops"]
+    key_interfaces:
+      - "compute_losses (src/training/losses.py)"
+      - "Trainer (src/training/core/trainer.py)"
+      - "TaskWeighter (src/training/multitask/weighting.py)"
+
+  - name: "distill"
+    responsibility: "run a local teacher, cache soft labels by content hash, and gate distillation on measured usefulness"
+    owns: ["src/distill/**", "tests/unit/distill/**"]
+    depends_on_modules: ["config", "data", "model", "training"]
+    key_interfaces:
+      - "build_soft_label_cache (src/distill/cache.py)"
+      - "distillation_gate (src/distill/gate.py)"
+
+  - name: "calibration"
+    responsibility: "per-bucket cross-fitted temperature maps, calibration metrics and the abstention policy"
+    owns: ["src/calibration/**", "tests/unit/calibration/**"]
+    depends_on_modules: ["config", "model"]
+    key_interfaces:
+      - "fit_temperature_map (src/calibration/temperature.py)"
+      - "abstention_threshold (src/calibration/abstain.py)"
+
+  - name: "evaluation"
+    responsibility: "metrics, baselines, robustness harness, ablations and the single evaluation report"
+    owns: ["src/evaluation/metrics.py", "src/evaluation/baselines.py", "src/evaluation/robustness.py", "src/evaluation/ablate.py", "src/evaluation/report.py", "tests/unit/evaluation/test_metrics.py", "tests/unit/evaluation/test_baselines.py", "tests/unit/evaluation/test_robustness.py", "tests/unit/evaluation/test_ablate.py", "tests/unit/evaluation/test_report.py"]
+    depends_on_modules: ["config", "data", "model", "calibration", "training", "ops"]
+    key_interfaces:
+      - "compute_metrics (src/evaluation/metrics.py)"
+      - "run_baselines (src/evaluation/baselines.py)"
+      - "run_robustness (src/evaluation/robustness.py)"
+      - "build_report (src/evaluation/report.py)"
+
+  - name: "inference"
+    responsibility: "the DecisionResult API, ONNX/INT8 export and benchmarks"
+    owns: ["src/inference/predictor.py", "src/inference/export.py", "src/inference/bench.py", "tests/unit/inference/**"]
+    depends_on_modules: ["config", "model", "calibration", "tokenization", "ops"]
+    key_interfaces:
+      - "Predictor.predict (src/inference/predictor.py)"
+      - "export_onnx (src/inference/export.py)"
+      - "run_benchmark (src/inference/bench.py)"
+
+  - name: "ops"
+    responsibility: "structured logging, run registry and reproducibility checks"
+    owns: ["src/ops/**", "tests/unit/ops/**"]
+    depends_on_modules: ["config"]
+    key_interfaces:
+      - "JsonlLogger (src/ops/logging.py)"
+      - "RunRegistry (src/ops/registry.py)"
+
+data_contracts:
+  "Option":
+    storage: "in-memory record; serialized inside DecisionExample parquet"
+    fields:
+      - { field: "text", type: "str", required: true, notes: "non-empty after NFC normalization; unique within an example" }
+      - { field: "label", type: "str", required: false, notes: "source label when the source is multiple-choice" }
+
+  "DecisionExample":
+    storage: "one parquet row; content hash is the primary key"
+    fields:
+      - { field: "example_id", type: "str", required: true, notes: "sha256 of task_family, goal, state and sorted option texts" }
+      - { field: "task_family", type: "str", required: true, notes: "one of choice, preference, scoring, probability, abstention, risk" }
+      - { field: "goal", type: "str", required: true, notes: "the decision to make, in one sentence" }
+      - { field: "state", type: "str", required: true, notes: "context the decision depends on; may be empty only for pure preference" }
+      - { field: "options", type: "list[Option]", required: true, notes: "2 to 8 elements in the default path" }
+      - { field: "chosen_index", type: "int", required: false, notes: "0-based; required for choice and preference families" }
+      - { field: "scores", type: "list[float]", required: false, notes: "normalized utility in 0..1 per option; length equals options" }
+      - { field: "answerable", type: "bool", required: false, notes: "false when the correct behaviour is to abstain" }
+      - { field: "risk_labels", type: "list[str]", required: false, notes: "subset of the eight declared risk categories" }
+      - { field: "source", type: "str", required: true, notes: "dataset identifier used by the provenance manifest" }
+      - { field: "license", type: "str", required: true, notes: "SPDX identifier copied from the acquisition manifest" }
+      - { field: "group_id", type: "str", required: true, notes: "prompt or document id; never crosses splits" }
+      - { field: "split", type: "str", required: true, notes: "train, dev or test" }
+
+  "RunManifest":
+    storage: "JSON at runs/<run_id>/manifest.json"
+    fields:
+      - { field: "run_id", type: "str", required: true, notes: "timestamp plus config hash prefix" }
+      - { field: "git_sha", type: "str", required: true, notes: "dirty tree is recorded as a boolean too" }
+      - { field: "config_hash", type: "str", required: true, notes: "sha256 of the resolved config" }
+      - { field: "data_fingerprint", type: "str", required: true, notes: "sha256 of the split manifest" }
+      - { field: "seed", type: "int", required: true, notes: "the seed used for python, numpy and torch" }
+      - { field: "device", type: "str", required: true, notes: "cuda device name plus compute capability" }
+      - { field: "versions", type: "dict", required: true, notes: "python, torch, transformers, datasets, onnxruntime" }
+
+  "TeacherLabel":
+    storage: "content-addressed float16 array plus JSON index under cache/teacher/<teacher_id>/"
+    fields:
+      - { field: "example_id", type: "str", required: true, notes: "joins to DecisionExample" }
+      - { field: "option_logprobs", type: "list[float]", required: true, notes: "length equals option count" }
+      - { field: "teacher_id", type: "str", required: true, notes: "model id plus revision plus quantization" }
+      - { field: "template_hash", type: "str", required: true, notes: "hash of the exact prompt template" }
+      - { field: "cache_hash", type: "str", required: true, notes: "sha256 of the payload; a mismatch invalidates the entry" }
+
+  "CalibrationMap":
+    storage: "JSON at runs/<run_id>/calibration.json"
+    fields:
+      - { field: "bucket_key", type: "str", required: true, notes: "task_family plus option-count bucket" }
+      - { field: "temperature", type: "float", required: true, notes: "greater than zero" }
+      - { field: "n_items", type: "int", required: true, notes: "items used to fit this bucket" }
+      - { field: "ece_before", type: "float", required: true, notes: "bucket ECE before scaling" }
+      - { field: "ece_after", type: "float", required: true, notes: "bucket ECE after scaling" }
+      - { field: "folds", type: "int", required: true, notes: "number of cross-fitting folds" }
+
+  "SplitManifest":
+    storage: "JSON at data/processed/split_manifest.json"
+    fields:
+      - { field: "fingerprint", type: "str", required: true, notes: "sha256 over split membership" }
+      - { field: "counts", type: "dict", required: true, notes: "rows per split per family" }
+      - { field: "group_overlap", type: "int", required: true, notes: "must be zero or the build fails" }
+      - { field: "dedup_threshold", type: "float", required: true, notes: "MinHash Jaccard threshold actually applied" }
+      - { field: "ood_source", type: "str", required: true, notes: "the withheld source; must be named and must have zero rows in train and dev (default UltraFeedback-binarized)" }
+
+  "EvalReport":
+    storage: "JSON plus markdown under runs/<run_id>/report.*"
+    fields:
+      - { field: "run_id", type: "str", required: true, notes: "links to the manifest" }
+      - { field: "arms", type: "list[str]", required: true, notes: "every ablation arm, including failed arms" }
+      - { field: "metrics", type: "dict", required: true, notes: "per family, per split, mean and std over seeds" }
+      - { field: "verdicts", type: "dict", required: true, notes: "pass, fail or not-measured per acceptance criterion" }
+
+api_contracts:
+  "inference":
+    - endpoint: "Predictor.predict(request) -> DecisionResult"
+      auth: "none; local library call"
+      request_payload: { "goal": "str", "state": "str", "options": "list[str]", "task_family": "str" }
+      success: "DecisionResult with chosen_index int, scores list[float], probabilities list[float], confidence float, abstain bool, risk list[float], temperature float"
+      error_shape: { code: "str", message: "str", retryable: "bool" }
+  "training":
+    - endpoint: "Trainer.train(config) -> Checkpoint"
+      auth: "none"
+      request_payload: { "config": "ResolvedConfig" }
+      success: "Checkpoint path plus the manifest of the run"
+      error_shape: { code: "str", message: "str", retryable: "bool" }
+  "calibration":
+    - endpoint: "fit_temperature_map(logits, labels, buckets, folds) -> CalibrationMap"
+      auth: "none"
+      request_payload: { "logits": "list[list[float]]", "labels": "list[int]", "buckets": "list[str]", "folds": "int" }
+      success: "CalibrationMap with one temperature per bucket and its item count"
+      error_shape: { code: "str", message: "str", retryable: "bool" }
+  "distill":
+    - endpoint: "build_soft_label_cache(examples, teacher_id, template) -> CacheIndex"
+      auth: "none"
+      request_payload: { "examples": "list[DecisionExample]", "teacher_id": "str", "template": "str" }
+      success: "Cache index with one row per example and the cache hash"
+      error_shape: { code: "str", message: "str", retryable: "bool" }
+  "evaluation":
+    - endpoint: "build_report(runs, baselines, ablations) -> EvalReport"
+      auth: "none"
+      request_payload: { "runs": "list[str]", "baselines": "list[str]", "ablations": "list[str]" }
+      success: "EvalReport with metrics per arm and verdicts per acceptance criterion"
+      error_shape: { code: "str", message: "str", retryable: "bool" }
+
+environment_matrix:
+  - { var: "RAPPORT_SEED", dev: "13", ci: "13", prod: "13", required: true }
+  - { var: "RAPPORT_DATA_DIR", dev: "data", ci: "data", prod: "data", required: true }
+  - { var: "RAPPORT_RUNS_DIR", dev: "runs", ci: "runs", prod: "runs", required: true }
+  - { var: "RAPPORT_DEVICE", dev: "cuda", ci: "cpu", prod: "cuda", required: true }
+  - { var: "RAPPORT_TEACHER", dev: "Qwen/Qwen3-1.7B", ci: "none", prod: "Qwen/Qwen3-1.7B", required: false }
+  - { var: "HF_HOME", dev: "/content/hf", ci: ".cache/hf", prod: "/content/hf", required: false }
+  - { var: "PYTORCH_CUDA_ALLOC_CONF", dev: "expandable_segments:True", ci: "expandable_segments:True", prod: "expandable_segments:True", required: false }
+  - { var: "CUBLAS_WORKSPACE_CONFIG", dev: ":4096:8", ci: ":4096:8", prod: ":4096:8", required: false }

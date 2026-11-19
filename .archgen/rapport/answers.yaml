@@ -1,0 +1,142 @@
+# schema_version: 1
+# generator: archgen v0.1.7
+# RAPPORT - captured requirements and the plan profile
+scope_class: "LARGE"
+intent_class: "GREENFIELD-SYSTEM"
+calibration:
+  scale: "single researcher, research-first project"
+  teamConstraints: "one operator; Google Colab Free with one NVIDIA Tesla T4 (16 GB, sm_75); no paid infrastructure may be required"
+  pressure: "research integrity over speed; no result may be reported without a reproducible command"
+plan_profile:
+  confidence: "high"
+  signals: ["new-module", "multi-module", "product-facing", "prototype"]
+  artifacts:
+    - path: ".archgen/rapport/answers.yaml"
+      decision: "create"
+      reason: "captured requirements and the plan profile"
+    - path: ".archgen/rapport/docs/prd.md"
+      decision: "create"
+      reason: "product-facing system with measurable acceptance targets"
+    - path: ".archgen/rapport/architecture.yaml"
+      decision: "create"
+      reason: "ten modules with cross-module data and API contracts"
+    - path: ".archgen/rapport/docs/rapport.md"
+      decision: "create"
+      reason: "topology, dependency direction and failure domains"
+    - path: ".archgen/rapport/docs/research.md"
+      decision: "create"
+      reason: "the required research review deliverable"
+    - path: ".archgen/rapport/docs/architecture-spec.md"
+      decision: "create"
+      reason: "the required architecture specification deliverable"
+    - path: ".archgen/rapport/docs/dataset-strategy.md"
+      decision: "create"
+      reason: "the required dataset strategy deliverable"
+    - path: ".archgen/rapport/docs/training-strategy.md"
+      decision: "create"
+      reason: "the required training strategy deliverable"
+    - path: ".archgen/rapport/docs/t4-optimization.md"
+      decision: "create"
+      reason: "the required T4 optimization deliverable"
+    - path: ".archgen/rapport/docs/evaluation.md"
+      decision: "create"
+      reason: "the required evaluation and benchmark deliverable"
+    - path: ".archgen/rapport/docs/risks.md"
+      decision: "create"
+      reason: "the required risk assessment deliverable"
+    - path: ".archgen/rapport/docs/mermaid-snippets.md"
+      decision: "create"
+      reason: "integration and model diagrams"
+    - path: ".archgen/rapport/tasks.yaml"
+      decision: "create"
+      reason: "the task contract every plan needs"
+    - path: ".archgen/rapport/plans/rapport.md"
+      decision: "create"
+      reason: "the plan of record"
+    - path: ".archgen/rapport/codebase-map.md"
+      decision: "omit"
+      reason: "not applicable to GREENFIELD-SYSTEM; there is no host code to survey"
+    - path: ".archgen/rapport/decisions/0001-<title>.md"
+      decision: "omit"
+      reason: "no irreversible, regulated or data-migration trigger; architecture decisions are recorded in docs/architecture-spec.md with their falsification test"
+  escalate_if: ["a hosted paid teacher becomes a requirement", "the target parameter count rises above 60M", "a regulated or personal-data corpus enters the mixture"]
+  gate:
+    verifier: "general sub-agent, fresh session (round 1 exhaustive) + general sub-agent, fresh session (round 2 delta)"
+    rounds: 2
+    findings:
+      blocking: 5
+      nit: 5
+      observation: 2
+    waived: 0
+    residual: 0
+    at: "2026-11-19T14:45:51Z"
+problem: "Bounded decisions (choose, rank, score, judge risk, abstain) are currently made by large generative models whose cost and latency scale with output tokens, or by fine-tuned classifiers that output a label without usable probabilities. Published 2026 evidence shows typed decision models are viable at 0.8B-27B parameters but leaves the 5M-60M regime unmeasured, and reports that their weakest behaviours are abstention and option-position bias."
+success_criteria:
+  - text: "RAPPORT-C beats a TF-IDF logistic-regression baseline by at least 8 accuracy points in-distribution and at least 5 points on a held-out source"
+    feeds: "prd.metrics"
+  - text: "Option-order permutation changes accuracy by at most 0.5 points and any score by at most 1e-4"
+    feeds: "prd.metrics"
+  - text: "Bucket-macro expected calibration error is at most 0.05 after per-bucket cross-fitted temperature scaling"
+    feeds: "prd.metrics"
+  - text: "At 80 percent coverage, selective accuracy exceeds full-coverage accuracy by at least 5 points"
+    feeds: "prd.metrics"
+  - text: "Batch-1 median decision latency is at most 12 ms on T4 and at most 150 ms for INT8 CPU inference"
+    feeds: "prd.metrics"
+  - text: "Total parameter count is at most 35M and the serialized artifact is at most 140 MB in FP32"
+    feeds: "prd.metrics"
+constraints:
+  - "Google Colab Free, one Tesla T4, 16 GB VRAM, sm_75, no bfloat16 tensor cores"
+  - "PyTorch primary framework; FP16 mixed precision with loss scaling"
+  - "No paid service may be required for any acceptance criterion"
+  - "Training must survive a Colab session interruption through checkpoint resume"
+  - "English-only v1, single-label and multi-label decisions over a bounded option set"
+non_goals:
+  - "conversational generation or open-ended text production"
+  - "general world knowledge beyond the measurable decision benchmarks"
+  - "multilingual or multimodal inputs in v1"
+  - "reinforcement learning in the first release"
+  - "state-of-the-art claims against frontier LLMs"
+personas:
+  - "application engineer: needs one forward pass to return a choice plus a calibrated probability, so the caller can route or abstain without parsing text"
+  - "research reviewer: needs every reported number to come from a named config, seed and data fingerprint"
+  - "model operator: needs a checkpoint that resumes after a Colab disconnect and exports to ONNX INT8"
+nfrs:
+  - "Performance: batch-1 median latency at most 12 ms on T4 FP16 for 512 tokens and 8 options"
+  - "Performance: throughput at least 300 decisions per second at batch 32 on T4"
+  - "Memory: peak training VRAM at most 8 GB at batch 64 so the runtime retains headroom"
+  - "Size: at most 35M parameters and at most 140 MB FP32 serialized"
+  - "Reliability: a killed training process resumes from the last checkpoint with an identical data order"
+  - "Reproducibility: identical config, seed and data fingerprint reproduce metrics within 0.5 accuracy points"
+  - "Security: no dataset row leaves the runtime; the teacher runs locally and its outputs are cached to disk"
+  - "i18n: English only; all text normalized to NFC and lowercased only for deduplication keys"
+out_of_scope:
+  - "distributed or multi-GPU training"
+  - "custom CUDA kernels"
+  - "pretraining a new tokenizer from raw text"
+  - "human evaluation studies"
+stack:
+  language: "Python"
+  runtime: "CPython 3.11 with PyTorch 2.x and CUDA 12.1 on Colab"
+  hosting: "local Colab runtime plus Google Drive for checkpoints"
+integrations:
+  - "Hugging Face datasets and transformers for corpus access and the frozen baselines"
+  - "ONNX Runtime for INT8 CPU export"
+  - "Qwen3-1.7B in 4-bit as the optional local teacher"
+compliance:
+  - "every corpus carries its license in the acquisition manifest; CC-BY-SA and undeclared-license sources are quarantined from the training mixture until reviewed"
+  - "no personal data is collected; Reddit-derived corpora are used under their published research licenses"
+risks:
+  - "the 25M-35M regime may sit below the capability floor implied by published 0.6B typed decision models"
+  - "label noise and annotation-convention mismatch dominate small-model accuracy"
+  - "pooled calibration metrics can hide large per-option-count miscalibration"
+  - "Colab session limits interrupt long runs without checkpoint resume"
+forks:
+  - question: "What is RAPPORT v1's decision domain"
+    answer: "A curated multi-task decision bench with five head families over six bounded task families"
+    rationale: "measurable, license-clean, and small enough that 25M-35M parameters is a defensible operating point"
+  - question: "Which distillation teacher"
+    answer: "Teacher-free v1, then a local 4-bit 1.7B-3B teacher for Stage C only, behind a pre-registered usefulness gate"
+    rationale: "keeps every acceptance runnable offline and free, and makes a weak teacher an abortable experiment rather than a dependency"
+  - question: "What sequence budget"
+    answer: "Train at 512 tokens with length bucketing, extend to 1024 at inference through RoPE base scaling"
+    rationale: "state plus eight options fits in 512; 1024 is an extrapolation that must be measured, not assumed"
