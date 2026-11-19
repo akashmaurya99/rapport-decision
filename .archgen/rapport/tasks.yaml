@@ -196,6 +196,7 @@ tasks:
       - "learned task weights are bounded by a floor of 0.05 and a cap of 4.0, logged every epoch, and a task at the floor for two consecutive epochs is surfaced as a WEIGHT_COLLAPSE event (covers FR-TRAIN-03)"
       - the resolved per-task weight vector is written to the manifest and to the run registry (covers FR-TRAIN-03)
       - a fixed-weight arm is registered for ablation A4
+    status: done
   - id: TASK-15
     title: Local-teacher soft-label distillation and its gate
     depends_on:
@@ -209,6 +210,7 @@ tasks:
       - "soft labels are cached by teacher_id, template_hash and example_id; a second invocation performs zero teacher forwards and reaches 100 percent cache hits (covers FR-DISTILL-01)"
       - "the distillation gate aborts and records a negative result when the teacher fails to load or scores below the supervised student by 3 points on dev, or the KD student is not at least 1 point above it (covers E8) (covers FR-DISTILL-02)"
       - the teacher runs locally inside the runtime and no network call is made beyond its one-time download (covers FR-DISTILL-01)
+    status: done
   - id: TASK-16
     title: Per-bucket calibration and the abstention policy
     depends_on:
@@ -331,6 +333,7 @@ tasks:
     acceptance:
       - "the benchmark warms up 50 passes, runs 1000 iterations, and reports p50, p95 and p99 for batch 1 and batch 32, plus batch-32 throughput, peak VRAM, peak RSS and serialized sizes for FP32, FP16 and INT8 (covers FR-INFER-03)"
       - "the report records GPU name, compute capability, driver, CUDA and torch versions, and flags any difference against an earlier run (covers FR-CONFIG-02)"
+    status: done
   - id: TASK-25
     title: End-to-end acceptance run and report
     depends_on:
