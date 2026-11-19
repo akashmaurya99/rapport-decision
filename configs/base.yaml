@@ -1,0 +1,15 @@
+# RAPPORT base run configuration. Every experiment config extends this file;
+# keep it scoped to config only (no model hyperparameters beyond training loop
+# controls) and free of unknown keys — the loader rejects them.
+seed: 13
+device: cuda
+data_dir: data
+runs_dir: runs
+fp16: true
+determinism: strict
+epochs: 10
+batch_size: 16
+learning_rate: 3.0e-5
+max_length: 512
+teacher: Qwen/Qwen3-1.7B
+data_fingerprint: ""
