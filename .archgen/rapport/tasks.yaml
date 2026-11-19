@@ -88,6 +88,7 @@ tasks:
       - "permuting the options permutes the scores by the same permutation within 1e-4, and no ordinal embedding or order-dependent path exists in the option markers (covers FR-MODEL-02)"
       - "all six heads return the shapes declared in docs/architecture-spec.md §4 and docs/prd.md FR-MODEL-03: choice_logits[n], scores[n], probability[1], confidence[1], answerable[1], risk[8] (covers FR-MODEL-03)"
       - "a single forward pass encodes the state and all options jointly, with no per-option forward pass in the default path (covers FR-MODEL-04)"
+    status: done
   - id: TASK-07
     title: Dataset acquisition and provenance manifests
     depends_on:
@@ -113,6 +114,7 @@ tasks:
       - exact dedup removes byte-identical normalized rows and reports per-source counts; near-dedup removes near-duplicates at Jaccard at least 0.9 and records the threshold (covers FR-DATA-03)
       - rules Q1 to Q6 each increment a named counter and the rejection report sums to the removed rows; no rule deletes a hard example for being hard (covers FR-DATA-04)
       - groups with contradictory gold labels are moved to a contested file with their count reported and no label is silently chosen
+    status: done
   - id: TASK-09
     title: Six task-family adapters into the unified schema
     depends_on:
@@ -137,6 +139,7 @@ tasks:
       - splitting by group_id into 70/15/15 leaves no group in two splits; the assertion fails the build otherwise (covers FR-DATA-06)
       - "the split manifest records the fingerprint, counts per family per split, the dedup threshold, a group_overlap of zero and the required ood_source field naming the withheld UltraFeedback-binarized; any positive overlap is a fatal error (covers E4)"
       - "one entire source is withheld for the OOD test and contributes zero rows to train and dev, and its identity is recorded in the manifest"
+    status: done
   - id: TASK-11
     title: Multi-task loss functions
     depends_on:
@@ -149,6 +152,7 @@ tasks:
       - "every loss matches a hand-computed value within 1e-5 on a fixed fixture, including the masked and empty-pair cases (covers FR-TRAIN-01)"
       - the abstention loss is masked when answerable is unset and the risk loss is masked when no risk labels are present
       - a non-finite loss surfaces a typed exception and never reaches the optimizer
+    status: done
   - id: TASK-12
     title: FP16 trainer core with checkpoint and resume
     depends_on:
@@ -215,6 +219,7 @@ tasks:
       - "per-category risk thresholds are fitted on dev to hold false-positive rate at most 0.10 on the dev safe rows drawn from Aegis safe-labeled prompts, frozen into the calibration map before test is read; the XSTest safe set is never used for fitting and remains the Y8 measurement set (covers FR-CALIB-03)"
       - the calibration module computes its own pooled ECE and bucket-macro ECE plus Brier score and NLL and does not depend on the evaluation module (covers FR-CALIB-02)
       - the abstention threshold derives from the declared utility triple and emits a risk-coverage curve; the default triple yields a threshold of 0.75 (covers FR-CALIB-03)
+    status: done
   - id: TASK-17
     title: Metrics implementation
     depends_on:
