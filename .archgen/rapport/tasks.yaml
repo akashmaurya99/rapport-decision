@@ -297,6 +297,7 @@ tasks:
       - "metrics are printed per family, per split, with seeds 13, 29 and 47, and a claim is printed only when the mean gap exceeds one seed standard deviation (covers FR-EVAL-05)"
       - "the report renders Y7 and Y8 verdicts (per-category risk recall at FPR at most 0.10 on the held-out Aegis rows with the keyword-rule baseline as comparator; over-refusal rate on the XSTest safe set), and refuses to print a pass when either input is missing (covers FR-EVAL-05)"
       - any blocking criterion with a fail verdict makes the report command exit non-zero (covers FR-EVAL-05)
+    status: done
   - id: TASK-22
     title: The DecisionResult prediction API
     depends_on:
