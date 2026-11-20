@@ -355,3 +355,4 @@ tasks:
       - scripts/e2e.py --config configs/experiments/acceptance.yaml --resume auto completes from a simulated mid-epoch kill and the resumed loss matches the uninterrupted run within 1e-4 (covers E10)
       - "the acceptance run trains on the full 115.6k mixture, produces runs/<id>/report.md with every Y1 to Y14 verdict (Y2 included, computed on the OOD block from the withheld source), and exits non-zero when a blocking criterion fails (covers FR-EVAL-05)"
       - a 55k starter smoke path is available on the same command as documented --starter and is not part of the acceptance verdict
+    status: done
