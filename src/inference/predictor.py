@@ -9,18 +9,26 @@ can leak into it (task identity stays implicit to the caller).
 
 Contract summary
 ----------------
-* ``chosen_index`` — argmax of the calibrated probabilities (ties resolve to
-  the lowest index); ``None`` when ``abstain`` is set. The option texts are
-  never emitted.
+* ``chosen_index`` — argmax of the **raw choice logits** (ties resolve to the
+  lowest index); ``None`` when ``abstain`` is set. Calibration never changes the
+  selected option: the raw decision and the reported option distribution always
+  agree on the argmax. The option texts are never emitted.
 * ``scores`` — the model's sigmoid utility per option, in option order,
   uncalibrated (calibration applies to the softmax distribution, not to the
   per-option utility).
 * ``probabilities`` — softmax over the listwise choice logits at the
-  calibration temperature; sums to 1.0.
-* ``confidence`` — the calibrated confidence, i.e. ``max(probabilities)``.
-  This is the same quantity :meth:`CalibrationMap.apply` reports and the same
-  quantity the abstention policy consumes; the raw confidence head remains on
-  ``RapportOutput`` for training/evaluation use.
+  calibration temperature; sums to 1.0. For Platt buckets this remains the raw
+  option distribution (its argmax is the raw choice-logit argmax); Platt scaling
+  does NOT re-distribute probability mass between options.
+* ``confidence`` — the calibrated **correctness** probability of the selected
+  option, i.e. the same scalar :meth:`CalibrationMap.apply` reports and the same
+  quantity the abstention policy consumes. For temperature buckets (and the
+  uncalibrated default) this equals ``max(probabilities)``. For Platt buckets it
+  is the Platt-corrected correctness ``sigmoid(a·logit(max_probs) + b)`` and is
+  deliberately **not** ``max(probabilities)``: a low correctness estimate lowers
+  ``confidence`` (potentially triggering abstention) but never re-ranks the
+  options. The raw confidence head remains on ``RapportOutput`` for
+  training/evaluation use.
 * ``abstain`` — ``True`` iff ``confidence < abstention_policy.threshold``
   (strictly below; the default policy derives the declared 0.75 threshold
   from the utility triple ``(1, -3, 0)``). Scores and probabilities are still
@@ -145,8 +153,12 @@ class DecisionRequest:
 class DecisionResult:
     """The prediction payload. Numbers only — no string field, by design.
 
-    ``chosen_index`` is ``None`` exactly when ``abstain`` is ``True``. The
-    annotation set is checked by the unit tests to contain no free text.
+    ``chosen_index`` is ``None`` exactly when ``abstain`` is ``True``; otherwise
+    it is the argmax of the raw choice logits, which always matches the argmax
+    of ``probabilities``. ``confidence`` is the calibrated *correctness*
+    probability of that option (equal to ``max(probabilities)`` for temperature
+    buckets, but a distinct Platt scalar for Platt buckets). The annotation set
+    is checked by the unit tests to contain no free text.
     """
 
     chosen_index: int | None
@@ -259,28 +271,27 @@ class Predictor:
                 f"model config at {path}: variant must be one of "
                 f"{sorted(_CONFIG_VARIANTS)}, got {variant!r}"
             )
-        model = RapportModel(_CONFIG_VARIANTS[variant])
         weights_path = payload.get("weights_path")
-        if weights_path is not None:
-            if not isinstance(weights_path, str) or not weights_path.strip():
-                raise PredictorConfigError(
-                    f"model config at {path}: weights_path must be a non-empty string, "
-                    f"got {weights_path!r}"
-                )
-            try:
-                state = torch.load(
-                    weights_path, map_location=self.device, weights_only=True
-                )
-            except Exception as exc:
-                raise PredictorConfigError(
-                    f"could not load weights from {weights_path}: {exc}"
-                ) from exc
-            try:
-                model.load_state_dict(state)
-            except (RuntimeError, KeyError) as exc:
-                raise PredictorConfigError(
-                    f"weights at {weights_path} do not match the {variant} architecture: {exc}"
-                ) from exc
+        if not isinstance(weights_path, str) or not weights_path.strip():
+            raise PredictorConfigError(
+                f"model config at {path}: weights_path is required; refusing to serve "
+                "random, untrained weights as a trained predictor"
+            )
+        model = RapportModel(_CONFIG_VARIANTS[variant])
+        try:
+            state = torch.load(
+                weights_path, map_location=self.device, weights_only=True
+            )
+        except Exception as exc:
+            raise PredictorConfigError(
+                f"could not load weights from {weights_path}: {exc}"
+            ) from exc
+        try:
+            model.load_state_dict(state)
+        except (RuntimeError, KeyError) as exc:
+            raise PredictorConfigError(
+                f"weights at {weights_path} do not match the {variant} architecture: {exc}"
+            ) from exc
         return model
 
     # ------------------------------------------------------------------
@@ -371,7 +382,7 @@ class Predictor:
             group_id="inference",
             split="test",
         )
-        encoded = encode_example(example, tokenizer=self.tokenizer)
+        encoded = encode_example(example, tokenizer=self.tokenizer, manifest={})
         ids = torch.tensor([list(encoded.input_ids)], dtype=torch.long, device=self.device)
         attention = torch.tensor(
             [list(encoded.attention_mask)], dtype=torch.long, device=self.device
@@ -412,10 +423,14 @@ class Predictor:
             confidence = max(probabilities)
             temperature = 1.0
 
+        # The decision follows the RAW choice-logit argmax, never a
+        # calibration-transformed distribution. Platt scaling recalibrates the
+        # correctness scalar (``confidence``) but must not re-rank options: with
+        # logits [4, 0] and Platt (a=0, b=-3) the calibrated correctness is
+        # sigmoid(-3) ~= 0.047, yet option 0 remains the choice.
+        raw_argmax = max(range(len(logits)), key=logits.__getitem__)
         abstain = self.abstention_policy.should_abstain(confidence)
-        chosen_index: int | None = (
-            None if abstain else max(range(len(probabilities)), key=probabilities.__getitem__)
-        )
+        chosen_index: int | None = None if abstain else raw_argmax
         scores = tuple(float(v) for v in output.scores[0].tolist())
         risk = tuple(float(v) for v in output.risk[0].tolist())
         return DecisionResult(

@@ -155,6 +155,7 @@ __all__ = [
     "ExportSelection",
     "GateOutcome",
     "OnnxExportMismatchError",
+    "OnnxArtifactInvalidError",
     "OnnxNotInstalledError",
     "QuantizationRejectedError",
     "QuantizationReportError",
@@ -188,6 +189,10 @@ class OnnxExportMismatchError(ExportError):
         super().__init__(message)
         self.max_abs_logit_diff = max_abs_logit_diff
         self.tolerance = tolerance
+
+
+class OnnxArtifactInvalidError(ExportError):
+    """A converted/quantized ONNX artifact failed checker/session/parity validation."""
 
 
 class QuantizationReportError(ExportError):
@@ -553,8 +558,60 @@ def _compare_against_pytorch(
     diffs: dict[str, float] = {}
     for name, onnx_out in zip(OUTPUT_NAMES, outputs, strict=True):
         torch_out = reference[name].detach().cpu().numpy()
+        if onnx_out.shape != torch_out.shape:
+            raise OnnxExportMismatchError(
+                f"ONNX output {name} shape {onnx_out.shape} != PyTorch {torch_out.shape}",
+                max_abs_logit_diff=float("inf"), tolerance=EXPORT_TOLERANCE,
+            )
         diff = np.abs(onnx_out.astype(np.float64) - torch_out.astype(np.float64)).max()
         diffs[name] = float(diff)
+    return diffs
+
+
+def _compare_sessions(
+    reference_session: Any, candidate_session: Any, batch: Mapping[str, Any]
+) -> dict[str, float]:
+    """Max-abs drift between two ORT sessions on the same feed (finite only)."""
+    import numpy as np
+
+    feed = _numpy_feed(batch)
+    reference = reference_session.run(list(OUTPUT_NAMES), feed)
+    candidate = candidate_session.run(list(OUTPUT_NAMES), feed)
+    diffs: dict[str, float] = {}
+    for name, ref_out, cand_out in zip(OUTPUT_NAMES, reference, candidate, strict=True):
+        if cand_out.shape != ref_out.shape:
+            raise OnnxArtifactInvalidError(
+                f"output {name} shape changed: {ref_out.shape} -> {cand_out.shape}"
+            )
+        diff = np.abs(cand_out.astype(np.float64) - ref_out.astype(np.float64)).max()
+        diffs[name] = float(diff)
+    return diffs
+
+
+def _compare_real_model_to_onnx(
+    model: RapportModel, path: Path, batch: Mapping[str, Tensor]
+) -> dict[str, float]:
+    """Verify the ONNX graph against the REAL RapportModel, not just the wrapper."""
+    import numpy as np
+
+    session = _onnx_session(path)
+    outputs = session.run(list(OUTPUT_NAMES), _numpy_feed(batch))
+    with torch.inference_mode():
+        real = model(
+            batch["input_ids"], batch["attention_mask"],
+            batch["option_mask"], batch["task_ids"],
+        )
+    diffs: dict[str, float] = {}
+    for name, onnx_out in zip(OUTPUT_NAMES, outputs, strict=True):
+        torch_out = getattr(real, name).detach().cpu().numpy()
+        if onnx_out.shape != torch_out.shape:
+            raise OnnxExportMismatchError(
+                f"ONNX output {name} shape {onnx_out.shape} != model {torch_out.shape}",
+                max_abs_logit_diff=float("inf"), tolerance=EXPORT_TOLERANCE,
+            )
+        diffs[name] = float(
+            np.abs(onnx_out.astype(np.float64) - torch_out.astype(np.float64)).max()
+        )
     return diffs
 
 
@@ -627,6 +684,12 @@ def export_onnx(
     onnx.save(inferred, str(out_path))
 
     diffs = _compare_against_pytorch(wrapper, out_path, batch)
+    # NaN > tolerance is False — reject non-finite diffs explicitly.
+    if any(not math.isfinite(value) for value in diffs.values()):
+        raise OnnxExportMismatchError(
+            f"ONNX export produced non-finite output diffs: {diffs}",
+            max_abs_logit_diff=float("inf"), tolerance=EXPORT_TOLERANCE,
+        )
     max_abs_logit_diff = diffs["choice_logits"]
 
     # Dynamic-axes smoke check: a different shape must run and match too.
@@ -634,18 +697,33 @@ def export_onnx(
         seed=REFERENCE_BATCH_SEED + 1,
         rows=3,
         width=4,
-        seq_len=REFERENCE_SEQ_LEN,
+        seq_len=max(16, REFERENCE_SEQ_LEN // 2),  # varied sequence length
         vocab_size=int(model.config.vocab_size),
     )
     smoke_diffs = _compare_against_pytorch(wrapper, out_path, smoke_batch)
-
-    if max_abs_logit_diff > EXPORT_TOLERANCE:
+    if any(not math.isfinite(value) for value in smoke_diffs.values()):
         raise OnnxExportMismatchError(
-            f"ONNX choice logits differ from PyTorch by {max_abs_logit_diff:.3e}, "
-            f"exceeding the {EXPORT_TOLERANCE:.1e} tolerance",
-            max_abs_logit_diff=max_abs_logit_diff,
-            tolerance=EXPORT_TOLERANCE,
+            f"ONNX dynamic-shape check produced non-finite diffs: {smoke_diffs}",
+            max_abs_logit_diff=float("inf"), tolerance=EXPORT_TOLERANCE,
         )
+
+    # Compare the wrapper AND the real RapportModel: a wrapper-only check can
+    # hide a disagreement between the exported graph and the shipped model.
+    real_diffs = _compare_real_model_to_onnx(model, out_path, batch)
+    real_smoke_diffs = _compare_real_model_to_onnx(model, out_path, smoke_batch)
+    for label, measured in (
+        ("reference", max_abs_logit_diff),
+        ("dynamic-shape", smoke_diffs["choice_logits"]),
+        ("real-model", real_diffs["choice_logits"]),
+        ("real-model dynamic-shape", real_smoke_diffs["choice_logits"]),
+    ):
+        if not math.isfinite(measured) or measured > EXPORT_TOLERANCE:
+            raise OnnxExportMismatchError(
+                f"ONNX {label} choice logits differ by {measured:.3e}, "
+                f"exceeding the {EXPORT_TOLERANCE:.1e} tolerance",
+                max_abs_logit_diff=float(measured),
+                tolerance=EXPORT_TOLERANCE,
+            )
 
     report: dict[str, Any] = {
         "artifact": "fp32",
@@ -666,10 +744,14 @@ def export_onnx(
         "dynamic_axes": _dynamic_axes(),
         "max_abs_logit_diff": float(max_abs_logit_diff),
         "max_abs_diffs": {name: float(value) for name, value in diffs.items()},
+        "all_comparisons_finite": True,
+        "real_model_max_abs_diffs": {name: float(v) for name, v in real_diffs.items()},
         "dynamic_axes_check": {
             "rows": 3,
             "width": 4,
+            "seq_len": max(16, REFERENCE_SEQ_LEN // 2),
             "max_abs_logit_diff": float(smoke_diffs["choice_logits"]),
+            "real_model_max_abs_logit_diff": float(real_smoke_diffs["choice_logits"]),
         },
         "identity_casts_removed": int(identity_casts_removed),
         "serialized_size_bytes": out_path.stat().st_size,
@@ -685,12 +767,28 @@ def export_onnx(
 # -- public API: FP16 conversion ------------------------------------------------------
 
 
-def convert_fp32_to_fp16(fp32_path: str | Path, out_path: str | Path) -> dict[str, Any]:
-    """Convert an FP32 ONNX artifact to FP16 weights (keeps I/O dtypes).
+#: FP16 weights lose precision; parity is compared with a tolerance that still
+#: catches a corrupted/invalid graph (e.g. a topological-sort failure) while
+#: tolerating legitimate half-precision rounding on the reference batch.
+FP16_PARITY_TOLERANCE = 5e-2
 
-    Returns a JSON-serializable report with the FP16 path and both file
-    sizes. Raises :class:`OnnxNotInstalledError` when onnxruntime's
-    float16 transformer is unavailable.
+
+def _convert_fp32_to_fp16_impl(
+    fp32_path: str | Path,
+    out_path: str | Path,
+    *,
+    reference_batch: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Convert FP32 ONNX to FP16 weights and VALIDATE the resulting artifact.
+
+    The converted graph must pass ``onnx.checker.check_model``, load in an ORT
+    session, and produce finite outputs matching the FP32 session on both the
+    full reference batch and a padded/smaller-shape batch. On any failure an
+    :class:`OnnxArtifactInvalidError` is raised and the artifact is NOT
+    reported as a valid size — the caller must not ship it.
+
+    ``reference_batch`` may be supplied to control the vocab size; otherwise it
+    is inferred from the FP32 graph's embedding initializer.
     """
     _require_ort()
     try:
@@ -705,8 +803,53 @@ def convert_fp32_to_fp16(fp32_path: str | Path, out_path: str | Path) -> dict[st
     target = Path(out_path)
     target.parent.mkdir(parents=True, exist_ok=True)
     model = onnx.load(str(source))
-    converted = convert_float_to_float16(model, keep_io_types=True)
+    try:
+        converted = convert_float_to_float16(model, keep_io_types=True)
+        # The transformer can emit a structurally invalid graph (verified:
+        # ONNX checker topological-sort ValidationError). Refuse it loudly.
+        onnx.checker.check_model(converted)
+    except Exception as exc:
+        raise OnnxArtifactInvalidError(
+            f"FP16 conversion produced an invalid ONNX graph: {type(exc).__name__}: {exc}"
+        ) from exc
     onnx.save(converted, str(target))
+
+    inferred_vocab = _infer_vocab_size(converted)
+    if reference_batch is None:
+        if inferred_vocab is None:
+            raise QuantizationReportError(
+                "could not infer vocab_size from the FP16 graph; pass reference_batch="
+            )
+        reference_batch = make_reference_batch(
+            seed=REFERENCE_BATCH_SEED,
+            rows=REFERENCE_BATCH_ROWS,
+            width=MAX_OPTIONS,
+            seq_len=REFERENCE_SEQ_LEN,
+            vocab_size=inferred_vocab,
+        )
+    padded_batch = make_reference_batch(
+        seed=REFERENCE_BATCH_SEED + 1,
+        rows=3,
+        width=4,
+        seq_len=REFERENCE_SEQ_LEN,
+        vocab_size=int(reference_batch["input_ids"].max()) + 1,
+    )
+    try:
+        fp32_session = _onnx_session(source)
+        fp16_session = _onnx_session(target)
+        diffs = _compare_sessions(fp32_session, fp16_session, reference_batch)
+        padded_diffs = _compare_sessions(fp32_session, fp16_session, padded_batch)
+    except Exception as exc:
+        raise OnnxArtifactInvalidError(
+            f"FP16 artifact failed ONNX Runtime validation: {type(exc).__name__}: {exc}"
+        ) from exc
+    for label, measured in (("reference", diffs), ("padded", padded_diffs)):
+        for name, diff in measured.items():
+            if not math.isfinite(diff) or diff > FP16_PARITY_TOLERANCE:
+                raise OnnxArtifactInvalidError(
+                    f"FP16 artifact {label} output {name} drifted by {diff:.3e} from FP32 "
+                    f"(tolerance {FP16_PARITY_TOLERANCE:.1e}); refusing the artifact"
+                )
     return _jsonable(
         {
             "artifact": "fp16",
@@ -714,8 +857,23 @@ def convert_fp32_to_fp16(fp32_path: str | Path, out_path: str | Path) -> dict[st
             "source_fp32_bytes": source.stat().st_size,
             "fp16_size_bytes": target.stat().st_size,
             "keep_io_types": True,
+            "checker_passed": True,
+            "ort_session_passed": True,
+            "reference_max_abs_diffs": {k: float(v) for k, v in diffs.items()},
+            "padded_max_abs_diffs": {k: float(v) for k, v in padded_diffs.items()},
+            "parity_tolerance": FP16_PARITY_TOLERANCE,
         }
     )
+
+
+def convert_fp32_to_fp16(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    """Convert and validate FP16; never leave a refused artifact behind."""
+    target = Path(kwargs.get("out_path", args[1] if len(args) > 1 else ""))
+    try:
+        return _convert_fp32_to_fp16_impl(*args, **kwargs)
+    except Exception:
+        target.unlink(missing_ok=True)
+        raise
 
 
 # -- public API: INT8 dynamic quantization -------------------------------------------
@@ -730,6 +888,31 @@ def _cosine_path_node_names(model: Any) -> list[str]:
     return [node.name for node in model.graph.node if _is_cosine_path_name(node.name or "")]
 
 
+def _quantized_cosine_path_is_fp32(model: Any, cosine_node_names: list[str]) -> bool:
+    """True iff the named cosine nodes are still float MatMuls in the graph.
+
+    ``quantize_dynamic`` can rewrite an excluded MatMul into a quantized op or
+    change its weight initializer dtype; checking only the pre-quantization
+    node names (as an earlier implementation did) cannot detect that.
+    """
+    wanted = set(cosine_node_names)
+    found: list[Any] = [
+        node for node in model.graph.node if (node.name or "") in wanted
+    ]
+    if not found or len(found) != len(wanted):
+        return False
+    float_weight_types = {1}  # TensorProto.FLOAT only; FP16/DOUBLE are not FP32
+    initializers = {init.name: init for init in model.graph.initializer}
+    for node in found:
+        if node.op_type != "MatMul":
+            return False
+        for input_name in node.input:
+            init = initializers.get(input_name)
+            if init is not None and init.data_type not in float_weight_types:
+                return False
+    return True
+
+
 def _infer_vocab_size(model: Any) -> int | None:
     for init in model.graph.initializer:
         name = init.name.lower()
@@ -740,7 +923,7 @@ def _infer_vocab_size(model: Any) -> int | None:
     return None
 
 
-def quantize_dynamic_int8(
+def _quantize_dynamic_int8_impl(
     onnx_path: str | Path,
     out_path: str | Path,
     *,
@@ -776,7 +959,11 @@ def quantize_dynamic_int8(
 
     model = onnx.load(str(source))
     cosine_nodes = _cosine_path_node_names(model)
-    cosine_score_path_fp32 = bool(cosine_nodes)
+    if not cosine_nodes:
+        raise OnnxArtifactInvalidError(
+            "no cosine score projection nodes found in the FP32 graph; cannot claim "
+            "the cosine path stays FP32 after quantization"
+        )
 
     quantize_dynamic(
         str(source),
@@ -801,21 +988,32 @@ def quantize_dynamic_int8(
         )
     fingerprint = _reference_fingerprint(reference_batch)
 
-    per_head_drift: dict[str, Any] = {}
-    try:
-        import numpy as np
+    # Inspect the QUANTIZED graph, not the pre-quantization node names: the
+    # cosine projections must still be plain float MatMul nodes with float
+    # weights (not MatMulInteger/QLinearMatMul).
+    quantized_model = onnx.load(str(target))
+    cosine_score_path_fp32 = _quantized_cosine_path_is_fp32(quantized_model, cosine_nodes)
+    if not cosine_score_path_fp32:
+        raise OnnxArtifactInvalidError(
+            "INT8 quantization changed the cosine score path operator types / weight "
+            "dtypes; the FP32 cosine-path claim is violated — refusing the artifact"
+        )
 
-        fp32_session = _onnx_session(source)
-        int8_session = _onnx_session(target)
-        feed = _numpy_feed(reference_batch)
-        fp32_outputs = fp32_session.run(list(OUTPUT_NAMES), feed)
-        int8_outputs = int8_session.run(list(OUTPUT_NAMES), feed)
-        for name, fp32_out, int8_out in zip(OUTPUT_NAMES, fp32_outputs, int8_outputs, strict=True):
-            per_head_drift[name] = float(
-                np.abs(int8_out.astype(np.float64) - fp32_out.astype(np.float64)).max()
+    # Drift evaluation is a validation step, not best-effort metadata: any
+    # failure refuses the quantized artifact.
+    try:
+        per_head_drift = _compare_sessions(
+            _onnx_session(source), _onnx_session(target), reference_batch
+        )
+    except Exception as exc:
+        raise OnnxArtifactInvalidError(
+            f"INT8 drift evaluation failed: {type(exc).__name__}: {exc}"
+        ) from exc
+    for name, drift in per_head_drift.items():
+        if not math.isfinite(drift):
+            raise OnnxArtifactInvalidError(
+                f"INT8 artifact produced non-finite output drift for {name}"
             )
-    except Exception as exc:  # pragma: no cover - drift is best-effort metadata
-        per_head_drift = {"error": str(exc)}
 
     return _jsonable(
         {
@@ -838,6 +1036,16 @@ def quantize_dynamic_int8(
             "int8_size_bytes": target.stat().st_size,
         }
     )
+
+
+def quantize_dynamic_int8(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    """Quantize and validate INT8; remove the target on every failure path."""
+    target = Path(kwargs.get("out_path", args[1] if len(args) > 1 else ""))
+    try:
+        return _quantize_dynamic_int8_impl(*args, **kwargs)
+    except Exception:
+        target.unlink(missing_ok=True)
+        raise
 
 
 # -- public API: the five-condition gate ---------------------------------------------

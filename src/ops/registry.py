@@ -2,11 +2,14 @@
 
 Scans a runs directory (``runs/<run_id>/manifest.json`` layout) and indexes
 every valid run by its ``run_id``. A run is *valid* only when its
-``manifest.json`` exists, parses as a JSON object, and carries non-empty
-string ``run_id``, ``config_hash`` and ``data_fingerprint`` fields — the full
-required set per the RunManifest contract in ``.archgen/rapport/architecture.yaml``.
+``manifest.json`` exists, parses as UTF-8 JSON object, and carries every
+required RunManifest field with the right type and format (sha256 hashes,
+portable run id matching its directory, non-negative int seed, version map) —
+the required set per ``.archgen/rapport/architecture.yaml``.
 
 A run that fails any of those checks is **excluded**, never silently listed:
+malformed encodings, unreadable files and duplicate ids are excluded rather
+than aborting the whole scan.
 the number of exclusions and their per-directory reasons are exposed via
 :attr:`RunRegistry.excluded_count` and :attr:`RunRegistry.exclusions`.
 
@@ -19,15 +22,59 @@ top-level ``*.pt`` / ``*.pth`` / ``*.ckpt`` / ``*.safetensors`` files).
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from .errors import RunRegistryError, UnknownRunError
 
 CHECKPOINT_SUFFIXES = (".pt", ".pth", ".ckpt", ".safetensors")
 
-REQUIRED_MANIFEST_FIELDS = ("run_id", "config_hash", "data_fingerprint")
+# Every field the RunManifest contract marks required (plus the two honesty
+# fields, git_dirty/compute_capability, which are optional by design).
+REQUIRED_MANIFEST_FIELDS = (
+    "run_id",
+    "git_sha",
+    "config_hash",
+    "data_fingerprint",
+    "seed",
+    "device",
+    "versions",
+)
+
+_HEX64 = re.compile(r"^[0-9a-f]{64}$")
+_PORTABLE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+def _valid_run_id(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and value not in (".", "..")
+        and not value.endswith(".")
+        and bool(_PORTABLE_ID.fullmatch(value))
+    )
+
+
+def _valid_versions(value: Any) -> bool:
+    return (
+        isinstance(value, dict)
+        and isinstance(value.get("python"), str)
+        and bool(value["python"].strip())
+    )
+
+
+_FIELD_VALIDATORS: dict[str, Callable[[Any], bool]] = {
+    "run_id": _valid_run_id,
+    "git_sha": lambda v: isinstance(v, str) and bool(v.strip()),
+    "config_hash": lambda v: isinstance(v, str) and bool(_HEX64.fullmatch(v)),
+    # An empty fingerprint is the documented placeholder before acquisition.
+    "data_fingerprint": lambda v: isinstance(v, str)
+    and (v == "" or bool(_PORTABLE_ID.fullmatch(v))),
+    "seed": lambda v: type(v) is int and 0 <= v <= 2**32 - 1,
+    "device": lambda v: isinstance(v, str) and bool(v.strip()),
+    "versions": _valid_versions,
+}
 
 
 @dataclass(frozen=True)
@@ -70,14 +117,13 @@ class RegistryScan:
 
 
 def _validate_manifest(parsed: Any) -> tuple[dict[str, Any] | None, str | None]:
-    """Return (manifest, None) when valid, else (None, reason)."""
+    """Return (manifest, None) when valid, else (None, stable reason)."""
     if not isinstance(parsed, dict):
         return None, "manifest_not_an_object"
     for field in REQUIRED_MANIFEST_FIELDS:
-        value = parsed.get(field)
-        if value is None:
+        if field not in parsed or parsed[field] is None:
             return None, f"missing_{field}"
-        if not isinstance(value, str) or not value.strip():
+        if not _FIELD_VALIDATORS[field](parsed[field]):
             return None, f"invalid_{field}"
     return parsed, None
 
@@ -113,21 +159,40 @@ class RunRegistry:
         exclusions: list[Exclusion] = []
         candidates: list[tuple[Path, dict[str, Any]]] = []
         total_dirs = 0
-        for child in sorted(self.root.iterdir()):
-            if not child.is_dir():
+        try:
+            children = sorted(self.root.iterdir())
+        except OSError as exc:
+            raise RunRegistryError(f"cannot list runs root {self.root}: {exc}") from exc
+        for child in children:
+            try:
+                is_dir = child.is_dir()
+            except OSError:
+                exclusions.append(Exclusion(child, "unreadable_run_dir"))
+                continue
+            if not is_dir:
                 continue
             total_dirs += 1
             manifest_path = child / "manifest.json"
-            if not manifest_path.is_file():
+            try:
+                exists = manifest_path.is_file()
+            except OSError:
+                exclusions.append(Exclusion(child, "unreadable_manifest"))
+                continue
+            if not exists:
                 exclusions.append(Exclusion(child, "missing_manifest"))
                 continue
             try:
-                parsed = json.loads(manifest_path.read_text(encoding="utf-8"))
-            except json.JSONDecodeError:
-                exclusions.append(Exclusion(child, "invalid_manifest_json"))
-                continue
+                raw = manifest_path.read_bytes()
             except OSError:
                 exclusions.append(Exclusion(child, "unreadable_manifest"))
+                continue
+            try:
+                parsed = json.loads(raw.decode("utf-8"))
+            except UnicodeError:
+                exclusions.append(Exclusion(child, "invalid_manifest_encoding"))
+                continue
+            except json.JSONDecodeError:
+                exclusions.append(Exclusion(child, "invalid_manifest_json"))
                 continue
             manifest, reason = _validate_manifest(parsed)
             if manifest is None:
@@ -148,13 +213,22 @@ class RunRegistry:
             if counts[run_id] > 1:
                 exclusions.append(Exclusion(run_dir, "duplicate_run_id"))
                 continue
+            # A manifest may never claim a different run than its directory.
+            if run_id != run_dir.name:
+                exclusions.append(Exclusion(run_dir, "run_id_mismatch"))
+                continue
+            try:
+                checkpoint_paths = _checkpoint_paths(run_dir)
+            except OSError:
+                exclusions.append(Exclusion(run_dir, "unreadable_checkpoints"))
+                continue
             entries[run_id] = RegistryEntry(
                 run_id=run_id,
                 manifest_path=run_dir / "manifest.json",
                 manifest=manifest,
                 config_hash=manifest["config_hash"],
                 data_fingerprint=manifest["data_fingerprint"],
-                checkpoint_paths=_checkpoint_paths(run_dir),
+                checkpoint_paths=checkpoint_paths,
             )
 
         # Artefacts directly in root (non-directory files) are not run dirs and

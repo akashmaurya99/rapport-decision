@@ -1,6 +1,6 @@
 # RAPPORT pipeline entry points. Every stage except `probe` delegates to
-# `python -m scripts.e2e --stage <name>` (scripts/e2e.py lands with TASK-25),
-# so stages fail until that entry point exists — by design.
+# `python -m scripts.e2e --stage <name>` (data = acquire+clean+adapt).
+# Use `make e2e` for the whole pipeline; `make e2e config=...` selects a config.
 #
 # `config=<path>` passes --config through, e.g.:
 #   make train config=configs/experiments/starter.yaml

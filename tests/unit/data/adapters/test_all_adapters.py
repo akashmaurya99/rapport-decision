@@ -47,7 +47,14 @@ def test_examples_carry_source_family_and_group_id(adapter_cls):
     result = adapter.to_decision_example([_rows()[adapter.name]])
     assert result.examples, adapter_cls.__name__
     for example in result.examples:
-        assert example.source == adapter.source
+        # Probability has per-shape provenance: auxiliary_train-derived rows
+        # are MMLU, not the adapter's TruthfulQA default.
+        expected_source = (
+            "cais/mmlu#auxiliary_train-derived-binary"
+            if adapter_cls.name == "probability"
+            else adapter.source
+        )
+        assert example.source == expected_source
         assert example.task_family == adapter.task_family
         assert example.group_id.strip()
         assert example.split in {"train", "dev", "test"}

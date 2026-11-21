@@ -205,6 +205,11 @@ def test_duplicate_risk_labels_rejected():
         normalize_example(_raw(risk_labels=["self-harm", "self-harm"]))
 
 
+def test_case_variant_duplicate_risk_labels_rejected():
+    with pytest.raises(RiskLabelInvalidError):
+        normalize_example(_raw(risk_labels=["Violence", "violence"]))
+
+
 def test_tampered_example_id_rejected():
     example = normalize_example(_raw())
     raw = _raw(example_id="0" * 64)

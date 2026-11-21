@@ -7,7 +7,7 @@
 arm: A2
 title: readout
 question: is cosine enough?
-init: bge-small
+init: scratch            # this architecture trains from scratch; a pretrained-trunk loader is not implemented
 variant: compact           # ultra 6/320 | compact 12/384 (recommended) | large 16/448
 layers: 12
 hidden: 384
@@ -15,7 +15,7 @@ readout: cosine            # this arm; cosine distance between marker and option
 readout_alternates: [cross-attn, cls-pooled]
 weight_mode: learned
 head_only: false
-ordering: curriculum
+ordering: fingerprint       # deterministic fingerprint order; the curriculum arm is not implemented
 mixture: starter           # 55k — ablations run on the starter; acceptance re-runs the winner
 mixture_rows: 55000
 seeds: [13, 29, 47]

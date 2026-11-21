@@ -27,9 +27,10 @@ permuted, yields exactly permuted scores. End-to-end perturbation is measured
 by TASK-19's robustness harness.
 
 Padding slots (``option_mask == 0``) are ignored everywhere: their affines are
-replaced by ``MASK_NEG`` before the softmax (so choice logits are directly
-listwise-softmax CE compatible with TASK-11), their utility scores are zeroed,
-and the choice distribution sums to 1 over real options only.
+replaced by a dtype-aware finite ``mask_neg_for(logits.dtype)`` before the
+softmax (so choice logits are directly listwise-softmax CE compatible with
+TASK-11, including in fp16), their utility scores are zeroed, and the choice
+distribution sums to 1 over real options only.
 """
 
 from __future__ import annotations
@@ -40,10 +41,22 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-# Finite stand-in for -inf in the padding slots of choice_logits. Large enough
-# that softmax over the slots assigns exactly 0 to padding, finite enough that
-# downstream cross-entropy (TASK-11) and ONNX export (TASK-23) never see inf/nan.
-MASK_NEG = -1e9
+
+def mask_neg_for(dtype: torch.dtype) -> float:
+    """Finite fill for padded choice logits in ``dtype``.
+
+    ``torch.finfo(dtype).min`` is large enough in magnitude that softmax assigns
+    exactly 0 to padding, yet finite: a fully-padded row stays finite (uniform)
+    instead of producing NaN, and cross-entropy (TASK-11) / ONNX export
+    (TASK-23) never see inf. It must be derived from the *target* tensor's dtype
+    — the literal -1e9 is not representable in fp16 and makes ``.half()`` raise.
+    """
+    return torch.finfo(dtype).min
+
+
+# Backwards-compatible fp32 alias. New code (and non-fp32 models) must use
+# ``mask_neg_for(dtype)`` so the fill stays representable in the logits' dtype.
+MASK_NEG = mask_neg_for(torch.float32)
 
 
 @dataclass(frozen=True)
@@ -108,7 +121,7 @@ class MarkerReadout(nn.Module):
         if hidden.dim() != 3:
             raise ValueError(f"hidden must be [B, T, d], got shape {tuple(hidden.shape)}")
         batch, _, d_model = hidden.shape
-        if d_model != self.d_model:
+        if not torch.jit.is_tracing() and d_model != self.d_model:
             raise ValueError(f"expected hidden width {self.d_model}, got {d_model}")
 
         goal_index = goal_positions.to(torch.long).view(batch, 1, 1)
@@ -121,7 +134,11 @@ class MarkerReadout(nn.Module):
         query = self.query(query)  # W_q q
         options = self.option(options)  # W_o o_i
 
-        cos = F.cosine_similarity(options, query.unsqueeze(1), dim=-1, eps=1e-8)  # [B, n]
+        # FP32 cosine prevents eps=1e-8 underflow and 0/0 NaNs for zero vectors
+        # in direct FP16 inference. The small readout cost is negligible.
+        cos = F.cosine_similarity(
+            options.float(), query.float().unsqueeze(1), dim=-1, eps=1e-8
+        ).to(options.dtype)  # [B, n]
         tau = torch.exp(self.log_tau[task_ids.to(torch.long)]).unsqueeze(1)  # [B, 1]
         raw = cos / tau  # spec §6 s_i
 
@@ -130,7 +147,7 @@ class MarkerReadout(nn.Module):
         logits = scale * raw + bias
 
         keep = option_mask.to(torch.bool)
-        choice_logits = logits.masked_fill(~keep, MASK_NEG)
+        choice_logits = logits.masked_fill(~keep, mask_neg_for(logits.dtype))
         score_vector = raw.masked_fill(~keep, 0.0)
         scores = torch.sigmoid(logits).masked_fill(~keep, 0.0)
         probabilities = torch.softmax(choice_logits, dim=-1)  # padding slots underflow to 0

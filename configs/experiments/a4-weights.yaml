@@ -8,7 +8,7 @@
 arm: A4
 title: weights
 question: does uncertainty weighting collapse a task?
-init: bge-small
+init: scratch            # this architecture trains from scratch; a pretrained-trunk loader is not implemented
 variant: compact           # ultra 6/320 | compact 12/384 (recommended) | large 16/448
 layers: 12
 hidden: 384
@@ -17,7 +17,7 @@ weight_mode: learned       # this arm; floor 0.05, cap 4.0 (docs/training-strate
 weight_floor: 0.05
 weight_cap: 4.0
 head_only: false
-ordering: curriculum
+ordering: fingerprint       # deterministic fingerprint order; the curriculum arm is not implemented
 mixture: starter           # 55k — ablations run on the starter; acceptance re-runs the winner
 mixture_rows: 55000
 seeds: [13, 29, 47]

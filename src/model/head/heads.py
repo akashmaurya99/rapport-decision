@@ -86,16 +86,27 @@ def confidence_features(cls_vector: Tensor, probabilities: Tensor) -> Tensor:
 
     ``probabilities`` is ``[B, n]`` with padding slots exactly 0 (padding
     cannot become the top choice and contributes 0 to the entropy). The margin
-    is ``p_max − p_second`` over real slots; with the guaranteed ``n ≥ 2`` both
-    terms exist. Returns ``[B, d + 3]``.
+    is ``p_max − p_second`` over real slots; both terms require ``n ≥ 2``.
+    Returns ``[B, d + 3]``.
     """
     if probabilities.dim() != 2:
         raise ValueError(
             f"probabilities must be [B, n], got shape {tuple(probabilities.shape)}"
         )
+    # Static shape checks are evaluated eagerly, but ONNX tracing records a
+    # Python bool and warns; during tracing the export validates shapes itself.
+    if not torch.jit.is_tracing() and probabilities.shape[-1] < 2:
+        raise ValueError(
+            "probabilities must have at least 2 option slots to form a margin, "
+            f"got {probabilities.shape[-1]}"
+        )
     top2 = torch.topk(probabilities, k=2, dim=-1).values
     p_max = top2[:, 0]
     margin = top2[:, 0] - top2[:, 1]
-    entropy = -(probabilities * torch.log(probabilities.clamp_min(_EPS))).sum(dim=-1)
+    # In fp16 a literal 1e-12 clamps to 0, so log(0) · 0 would poison the entropy
+    # with NaN. Use the smallest normal of the tensor's dtype as the floor;
+    # for fp32 this is smaller than _EPS, so existing behaviour is unchanged.
+    eps = max(_EPS, torch.finfo(probabilities.dtype).tiny)
+    entropy = -(probabilities * torch.log(probabilities.clamp_min(eps))).sum(dim=-1)
     scalars = torch.stack((p_max, margin, entropy), dim=-1)
     return torch.cat((cls_vector, scalars), dim=-1)

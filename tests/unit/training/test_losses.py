@@ -592,6 +592,33 @@ def test_total_is_differentiable_and_backward_runs():
     assert bool(torch.isfinite(logits.grad).all())
 
 
+def test_preference_and_score_upcast_to_fp32_under_autocast():
+    """The preference/score terms must not stay in fp16 under autocast."""
+
+    def half(t):
+        return torch.tensor(t, dtype=torch.float16)
+
+    output = RapportOutput(
+        choice_logits=half(CHOICE_LOGITS),
+        scores=half(SCORES),
+        probability=half(PROBABILITY),
+        confidence=half(CONFIDENCE),
+        answerable=half(ANSWERABLE),
+        risk=half(RISK),
+        score_vector=half(SCORES),
+    )
+    kwargs = _kwargs()
+    with torch.autocast("cpu", dtype=torch.float16):
+        result = compute_losses(output, _mask(), **kwargs)
+        assert result.preference.dtype == torch.float32
+        assert result.score.dtype == torch.float32
+        assert result.total.dtype == torch.float32
+        # Values still match the fp32 reference (within fp16 rounding).
+        reference = _fixture()
+        assert result.preference.item() == pytest.approx(reference.preference.item(), abs=1e-3)
+        assert result.score.item() == pytest.approx(reference.score.item(), abs=1e-3)
+
+
 def test_loss_breakdown_fields():
     result = _fixture()
     for field_name in (

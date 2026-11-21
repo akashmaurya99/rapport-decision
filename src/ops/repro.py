@@ -16,6 +16,11 @@ the reproduced final loss matches the recorded value within a tolerance
    trainer; this module is the bounded, network-free gate that proves the
    replay machinery itself is sound.
 
+The public :func:`verify_resume` also accepts two loss trajectories and
+returns a plain ``bool`` ("did this resume reproduce that run?"), which is the
+clean helper for the e2e wave; the numpy workload below remains the reference
+implementation and the ``seed=...`` calling convention.
+
 The recorded loss comes from either an explicit ``recorded_loss`` argument or
 a JSONL log written by :class:`src.ops.logging.JsonlLogger`
 (``recorded_path``), in which case the record with the highest ``step`` whose
@@ -25,9 +30,10 @@ a JSONL log written by :class:`src.ops.logging.JsonlLogger`
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, overload
 
 import numpy as np
 
@@ -118,7 +124,95 @@ def _recorded_loss_from_jsonl(path: Path) -> float:
     return best_loss
 
 
+@overload
 def verify_resume(
+    trajectory_a: Any,
+    trajectory_b: Any,
+    tolerance: float = DEFAULT_TOLERANCE,
+) -> bool: ...
+
+
+@overload
+def verify_resume(
+    *,
+    seed: int,
+    replay_steps: int = DEFAULT_REPLAY_STEPS,
+    tolerance: float = DEFAULT_TOLERANCE,
+    recorded_loss: float | None = None,
+    recorded_path: str | Path | None = None,
+) -> ReproductionResult: ...
+
+
+def verify_resume(*args: Any, **kwargs: Any) -> bool | ReproductionResult:
+    """Compare two trajectories, or run the recorded-loss reference check.
+
+    Two calling conventions are supported:
+
+    * ``verify_resume(trajectory_a, trajectory_b, tolerance=1e-4) -> bool`` —
+      the clean helper for the e2e wave: two sequences of per-step losses
+      (e.g. an original run and a resumed run). Returns ``True`` only when
+      both have the same length and every pair is within ``tolerance``.
+    * ``verify_resume(seed=..., recorded_loss=... | recorded_path=...)`` —
+      the original bounded numpy reference workload check, returning a
+      :class:`ReproductionResult` (still used by the unit suite).
+
+    Invalid inputs raise :class:`ReproductionError` in both modes.
+    """
+    if args:
+        if len(args) < 2:
+            raise ReproductionError("verify_resume requires two trajectories")
+        if len(args) > 3:
+            raise ReproductionError("verify_resume accepts at most three positional arguments")
+        if kwargs and set(kwargs) - {"tolerance"}:
+            raise ReproductionError(f"unexpected keyword arguments: {sorted(kwargs)}")
+        tolerance = args[2] if len(args) > 2 else kwargs.get("tolerance", DEFAULT_TOLERANCE)
+        return _verify_trajectories(args[0], args[1], tolerance)
+    if "trajectory_a" in kwargs or "trajectory_b" in kwargs:
+        unexpected = set(kwargs) - {"trajectory_a", "trajectory_b", "tolerance"}
+        if unexpected:
+            raise ReproductionError(f"unexpected keyword arguments: {sorted(unexpected)}")
+        return _verify_trajectories(
+            kwargs.get("trajectory_a"), kwargs.get("trajectory_b"),
+            kwargs.get("tolerance", DEFAULT_TOLERANCE),
+        )
+    return _verify_reference(**kwargs)
+
+
+def _as_trajectory(value: Any, name: str) -> tuple[float, ...]:
+    if isinstance(value, (str, bytes, bytearray, Mapping)) or value is None:
+        raise ReproductionError(f"{name} must be a sequence of numbers, got {type(value).__name__}")
+    try:
+        items = list(value)
+    except TypeError as exc:
+        raise ReproductionError(f"{name} must be iterable: {exc}") from exc
+    result: list[float] = []
+    for item in items:
+        if isinstance(item, bool) or not isinstance(item, (int, float, np.integer, np.floating)):
+            raise ReproductionError(f"{name} contains a non-numeric value: {item!r}")
+        number = float(item)
+        if not math.isfinite(number):
+            raise ReproductionError(f"{name} contains a non-finite value: {item!r}")
+        result.append(number)
+    return tuple(result)
+
+
+def _verify_trajectories(trajectory_a: Any, trajectory_b: Any, tolerance: Any) -> bool:
+    """Element-wise comparison of two loss trajectories."""
+    if isinstance(tolerance, bool) or not isinstance(tolerance, (int, float)):
+        raise ReproductionError(f"tolerance must be a real number, got {tolerance!r}")
+    tolerance = float(tolerance)
+    if not math.isfinite(tolerance) or tolerance <= 0.0:
+        raise ReproductionError(f"tolerance must be finite and > 0, got {tolerance!r}")
+    first = _as_trajectory(trajectory_a, "trajectory_a")
+    second = _as_trajectory(trajectory_b, "trajectory_b")
+    if not first or not second:
+        raise ReproductionError("empty trajectories are not resume evidence")
+    if len(first) != len(second):
+        return False
+    return all(abs(a - b) <= tolerance for a, b in zip(first, second))
+
+
+def _verify_reference(
     *,
     seed: int,
     replay_steps: int = DEFAULT_REPLAY_STEPS,

@@ -99,6 +99,12 @@ def test_confidence_features_rejects_non_2d_probabilities():
         confidence_features(torch.zeros(1, 4), torch.zeros(4))
 
 
+def test_confidence_features_rejects_single_option_slot():
+    """Public API: topk(k=2) cannot form a margin with n=1; fail explicitly."""
+    with pytest.raises(ValueError, match="at least 2 option slots"):
+        confidence_features(torch.zeros(1, 4), torch.tensor([[1.0]]))
+
+
 # --- Readout softmax contract ---------------------------------------------------
 
 def test_choice_distribution_is_a_probability_distribution():

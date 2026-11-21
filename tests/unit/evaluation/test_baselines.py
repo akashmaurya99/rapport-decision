@@ -43,7 +43,6 @@ from src.evaluation.baselines import (  # noqa: E402
     y1_verdict,
 )
 
-FINGERPRINT = "a1" * 32  # lowercase sha256 hex
 OTHER_FINGERPRINT = "b2" * 32
 
 
@@ -140,6 +139,21 @@ def fixture_rows():
     return train, dev, test
 
 
+def _fingerprint_for(train, dev, test):
+    """The real membership fingerprint of a given row stream."""
+    from src.data.splits.fingerprint import membership_fingerprint
+    return membership_fingerprint(
+        (row.example_id, row.split)
+        for group in (train, dev, test)
+        for row in group
+    )
+
+
+# FINGERPRINT must be the digest of the actual fixture membership: the runner
+# now verifies the fingerprint against the rows rather than echoing it.
+FINGERPRINT = _fingerprint_for(*fixture_rows())
+
+
 @pytest.fixture(scope="module")
 def rows():
     return fixture_rows()
@@ -187,6 +201,23 @@ def test_chosen_index_out_of_range_raises(rows):
                    2, "test", "t-bad")
     with pytest.raises(BaselineInputError):
         MajorityClassBaseline().run(train, dev, [bad], FINGERPRINT)
+
+
+def test_fingerprint_mismatch_with_actual_row_membership_is_rejected(rows):
+    train, dev, test = rows
+    with pytest.raises(BaselineInputError, match="does not match the actual"):
+        MajorityClassBaseline().run(train, dev, test, OTHER_FINGERPRINT)
+
+
+def test_invalid_abstention_index_is_not_silently_skipped(rows):
+    train, dev, _ = rows
+    bad = _example("abstention", "bad index", "state", ("Answerable", "Unanswerable"),
+                   99, "dev", "ab-bad")
+    dev_rows = dev + [bad]
+    with pytest.raises(BaselineInputError, match="out of range"):
+        MajorityClassBaseline().run(
+            train, dev_rows, [], _fingerprint_for(train, dev_rows, [])
+        )
 
 
 def test_run_baselines_returns_three_results_same_fingerprint(run_results):
@@ -237,7 +268,7 @@ def test_choice_row_without_chosen_index_is_skipped():
                        None, "train", "c-nogold")
     train = [_choice2("goal alpha case", "train", "ng-0", 0), no_gold]
     dev = [_choice2("goal beta dev q", "dev", "ng-d", 1)]
-    res = MajorityClassBaseline().run(train, dev, [], FINGERPRINT)
+    res = MajorityClassBaseline().run(train, dev, [], _fingerprint_for(train, dev, []))
     assert res.skipped["train"]["no-chosen-index"] == 1
     assert res.n_train == 2
     assert res.dev.n_items == 1
@@ -250,7 +281,7 @@ def test_b1_predicts_majority_class():
     train = [_choice2(f"goal alpha case {i}", "train", f"m-{i}", 1) for i in range(5)]
     train += [_choice2("goal beta case x", "train", "m-x", 0)]
     dev = [_choice2("goal alpha dev q", "dev", "m-d", 0)]
-    res = MajorityClassBaseline().run(train, dev, [], FINGERPRINT)
+    res = MajorityClassBaseline().run(train, dev, [], _fingerprint_for(train, dev, []))
     assert res.dev.accuracy == pytest.approx(0.0)  # deterministic majority → always 1
     assert res.dev_per_family["choice"].accuracy == pytest.approx(0.0)
 
@@ -259,7 +290,7 @@ def test_b1_tie_breaks_to_lowest_index():
     train = [_choice2("goal alpha case 0", "train", "t0", 0),
              _choice2("goal beta case 0", "train", "t1", 1)]
     dev = [_choice2("goal beta dev q", "dev", "t-d", 1)]
-    res = MajorityClassBaseline().run(train, dev, [], FINGERPRINT)
+    res = MajorityClassBaseline().run(train, dev, [], _fingerprint_for(train, dev, []))
     assert res.dev.accuracy == pytest.approx(0.0)  # tie → index 0 predicted
 
 
@@ -268,7 +299,7 @@ def test_b1_probabilities_are_empirical_frequencies():
     train = [_choice2(f"goal alpha case {i}", "train", f"f-{i}", 0) for i in range(3)]
     train += [_choice2("goal beta case f", "train", "f-b", 1)]
     dev = [_choice2("goal alpha dev q", "dev", "f-d", 0)]
-    res = runner.run(train, dev, [], FINGERPRINT)
+    res = runner.run(train, dev, [], _fingerprint_for(train, dev, []))
     # empirical 0.75/0.25 → Brier/accuracy consistent with p=(0.75, 0.25)
     probs = 0.75
     assert res.dev.brier == pytest.approx((probs - 1) ** 2 * probs + (1 - probs) ** 2 * (1 - probs))
@@ -280,14 +311,14 @@ def test_b1_bucket_fallback_to_family_pool():
              _choice3("choose gamma marker again", "train", "fb-1", 0),
              _choice3("pick delta marker", "train", "fb-2", 1)]
     dev = [_choice2("goal alpha dev q", "dev", "fb-d", 0)]
-    res = MajorityClassBaseline().run(train, dev, [], FINGERPRINT)
+    res = MajorityClassBaseline().run(train, dev, [], _fingerprint_for(train, dev, []))
     # family-pooled distribution [0.667, 0.333, 0] → truncated to 2 → renormalized
     assert res.dev.accuracy == pytest.approx(1.0)
 
 
 def test_b1_empty_train_falls_back_uniform():
     dev = [_choice2("goal alpha dev q", "dev", "e-d", 0)]
-    res = MajorityClassBaseline().run([], dev, [], FINGERPRINT)
+    res = MajorityClassBaseline().run([], dev, [], _fingerprint_for([], dev, []))
     assert res.dev.n_items == 1
     assert any("no labeled" in n for n in res.notes)
 
@@ -334,7 +365,9 @@ def test_b3_unseen_option_count_bucket_falls_back(rows):
     train, dev, test = rows
     two_option_train = [r for r in train if len(r.options) == 2 and r.task_family in
                         ("choice", "preference") and r.chosen_index is not None]
-    res = TfidfLogisticBaseline().run(two_option_train, dev, [], FINGERPRINT)
+    res = TfidfLogisticBaseline().run(
+        two_option_train, dev, [], _fingerprint_for(two_option_train, dev, [])
+    )
     assert res.dev.n_items == 6
     assert any("unseen in train" in n for n in res.notes)
     for probs in (r for r in res.dev_per_family.values()):
@@ -343,7 +376,7 @@ def test_b3_unseen_option_count_bucket_falls_back(rows):
 
 def test_b3_empty_train_emits_uniform_predictions(rows):
     _, dev, _ = rows
-    res = TfidfLogisticBaseline().run([], dev, [], FINGERPRINT)
+    res = TfidfLogisticBaseline().run([], dev, [], _fingerprint_for([], dev, []))
     assert res.dev.n_items == 6
     assert any("no labeled" in n for n in res.notes)
 
@@ -441,7 +474,9 @@ def test_abstention_without_chosen_index(rows):
     train, dev, _ = rows
     no_gold = _example("abstention", "unanswerable", "no gold", ("Answerable", "Unanswerable"),
                        None, "dev", "no-gold")
-    res = MajorityClassBaseline().run(train, [no_gold], [], FINGERPRINT)
+    res = MajorityClassBaseline().run(
+        train, [no_gold], [], _fingerprint_for(train, [no_gold], [])
+    )
     assert res.dev_abstention is not None
     assert res.dev_abstention.n_rows == 1
     assert res.dev_abstention.n_scored == 0

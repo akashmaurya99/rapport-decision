@@ -26,12 +26,15 @@ thousands of rows) and is documented as such. A production-scale run must
 replace ``_candidate_pairs`` with an LSH index before the dataset grows past
 that.
 
-Near dedup never merges two rows whose gold option *text* differs: those
-are contradiction candidates, not duplicates, and merging them would
-silently choose one gold label. They survive to the contradiction audit
-untouched. Comparing the gold text (rather than the raw ``chosen_index``)
-keeps the guard permutation-aware: the same gold text reached through a
-permuted option list is still a duplicate.
+Near dedup never merges two rows whose label payload differs: those are
+contradiction candidates, not duplicates, and merging them would silently
+choose one annotation. The payload is the full set of family labels — gold
+option *text*, ``scores`` (aligned to option text, so option permutation is
+invariant), ``answerable`` and ``risk_labels`` — returned by
+:func:`label_signature`. Rows that differ in any of those survive to the
+contradiction audit untouched. Comparing the gold text (rather than the raw
+``chosen_index``) keeps the guard permutation-aware: the same gold text
+reached through a permuted option list is still a duplicate.
 """
 
 from __future__ import annotations
@@ -57,10 +60,12 @@ DEFAULT_SEED = 1729
 def exact_key(example: DecisionExample) -> tuple:
     """Return the normalized exact-dedup key for ``example``.
 
-    ``(task_family, goal, state, sorted option texts, chosen_index)``. The
-    texts are the fields TASK-03 normalization produced; sorting the option
-    texts makes the key option-order invariant, matching the philosophy of
-    ``compute_example_id``.
+    ``(task_family, goal, state, sorted option texts, chosen_index,
+    label_signature)``. The texts are the fields TASK-03 normalization
+    produced; sorting the option texts makes the key option-order invariant,
+    matching the philosophy of ``compute_example_id``. The appended label
+    signature keeps conflicting annotations from being collapsed by exact
+    dedup into a single (first-wins) gold label.
     """
     return (
         example.task_family,
@@ -68,6 +73,7 @@ def exact_key(example: DecisionExample) -> tuple:
         example.state,
         tuple(sorted(option.text for option in example.options)),
         example.chosen_index,
+        label_signature(example),
     )
 
 
@@ -125,6 +131,35 @@ def gold_signature(example: DecisionExample) -> str | None:
     if not 0 <= chosen < len(example.options):
         return None
     return example.options[chosen].text
+
+
+def label_signature(example: DecisionExample) -> tuple:
+    """Return the full, option-permutation-invariant label payload.
+
+    ``(gold_text, scores, answerable, risk_labels)`` where ``scores`` is a
+    sorted ``(option_text, score)`` tuple and ``risk_labels`` is a sorted
+    case-folded tuple. Every family's annotation lives in one of those four
+    slots, so two rows with the same content but conflicting annotations get
+    different signatures and are routed to the contradiction audit instead
+    of being silently merged first-wins.
+    """
+    scores: tuple[tuple[str, float], ...] | None = None
+    if example.scores is not None:
+        scores = tuple(
+            sorted(
+                (option.text, float(score))
+                for option, score in zip(example.options, example.scores)
+            )
+        )
+    risk_labels: tuple[str, ...] | None = None
+    if example.risk_labels is not None:
+        risk_labels = tuple(sorted(label.strip().casefold() for label in example.risk_labels))
+    return (
+        gold_signature(example),
+        scores,
+        example.answerable,
+        risk_labels,
+    )
 
 
 def canonical_document(example: DecisionExample) -> str:
@@ -271,9 +306,22 @@ class NearDedup:
         for i, j in self._candidate_pairs(signatures):
             pair_count += 1
             left, right = examples[i], examples[j]
-            # Rows with different gold labels are contradiction candidates,
-            # not duplicates: merging them would silently choose a label.
-            if gold_signature(left) != gold_signature(right):
+            # Preference intentionally emits both option orientations for one
+            # prompt as de-biasing augmentation. Their gold text is identical
+            # but chosen_index differs; merging them would silently delete half
+            # the augmentation. Exact copies of the SAME orientation still dedup.
+            intentional_preference_pair = (
+                left.task_family == right.task_family == "preference"
+                and left.group_id == right.group_id
+                and left.chosen_index != right.chosen_index
+                and gold_signature(left) == gold_signature(right)
+            )
+            if intentional_preference_pair:
+                continue
+            # Rows with different label payloads are contradiction
+            # candidates, not duplicates: merging them would silently choose
+            # an annotation (gold text, score, answerability or risk label).
+            if label_signature(left) != label_signature(right):
                 continue
             if estimate_jaccard(signatures[i], signatures[j]) >= self.threshold:
                 union_find.union(i, j)

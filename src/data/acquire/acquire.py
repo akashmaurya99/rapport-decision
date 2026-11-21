@@ -17,7 +17,10 @@ One call to :func:`acquire_source` performs, in order:
    (default: the live Hub downloader in ``src.data.acquire.hub``, which tests
    never exercise) through an optional predicate and column projection, and
    land in parquet shards of at most ``rows_per_shard`` rows. Nothing is
-   materialized in memory beyond one shard.
+   materialized in memory beyond one shard. When an ``adapter`` is supplied,
+   each shard is written in the unified :class:`DecisionExample` layout that
+   ``src.data.core.parquet.read_parquet`` reads back directly; without one,
+   shards carry the raw source columns and must be adapted before that read.
 4. **Cap enforcement, before bytes hit disk** — each shard is encoded to an
    in-memory buffer first; if the running total plus the new shard's byte
    size would exceed ``max_bytes`` (default 200 MB, the per-run ceiling from
@@ -44,6 +47,8 @@ from collections.abc import Callable, Iterator, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, NoReturn, Protocol
+
+from src.data.core.serialize import to_dict
 
 from .errors import (
     AcquireError,
@@ -196,12 +201,15 @@ def _acquire_into_tmp(
     rows_per_shard: int,
     max_bytes: int,
     downloader: Downloader,
-) -> tuple[list[tuple[str, Path, str, int]], int]:
+    adapter: Any | None,
+) -> tuple[list[tuple[str, Path, str, int]], int, int, list[dict[str, Any]], list[dict[str, Any]]]:
     """Stream rows into ``tmp_dir``; return shard records and row count.
 
     Shard records are ``(shard_name, tmp_path, sha256, nbytes)``. Raises
     :class:`_CapExceeded` *before writing a shard that would breach
-    ``max_bytes``* — no over-cap file ever lands on disk.
+    ``max_bytes``* — no over-cap file ever lands on disk. With ``adapter``
+    set, each batch is mapped to :class:`DecisionExample` records before
+    encoding, so the resulting shard is readable by ``read_parquet``.
     """
     try:
         iterator = iter(downloader(source, split=split))
@@ -213,14 +221,32 @@ def _acquire_into_tmp(
     shards: list[tuple[str, Path, str, int]] = []
     total_bytes = 0
     observed_rows = 0
+    raw_input_rows = 0
+    adapter_reports: list[dict[str, Any]] = []
+    rejected_records: list[dict[str, Any]] = []
     batch: list[dict[str, Any]] = []
     shard_index = 0
 
     def flush() -> None:
-        nonlocal batch, shard_index, total_bytes
+        nonlocal batch, shard_index, total_bytes, observed_rows, raw_input_rows
         if not batch:
             return
-        payload, digest, nbytes = _encode_shard(batch)
+        shard_rows: list[dict[str, Any]] = batch
+        raw_input_rows += len(batch)
+        if adapter is not None:
+            result = adapter.to_decision_example(batch)
+            shard_rows = [to_dict(example) for example in result.examples]
+            observed_rows += len(shard_rows)
+            adapter_reports.append(dict(result.report))
+            rejected_records.extend(
+                {
+                    "record_index": rejection.record_index,
+                    "reason": rejection.reason_code,
+                    "detail": rejection.detail,
+                }
+                for rejection in result.rejected
+            )
+        payload, digest, nbytes = _encode_shard(shard_rows)
         if total_bytes + nbytes > max_bytes:
             raise _CapExceeded(total_bytes + nbytes, observed_rows)
         shard_name = f"{_sanitize_shard_stem(source)}-{shard_index:05d}.parquet"
@@ -275,7 +301,8 @@ def _acquire_into_tmp(
                     row_index += 1
                     continue
             batch.append(projected)
-            observed_rows += 1
+            if adapter is None:
+                observed_rows += 1
             row_index += 1
             if len(batch) >= rows_per_shard:
                 flush()
@@ -289,7 +316,7 @@ def _acquire_into_tmp(
             f"downloader for source {source!r} failed: {exc}", source=source
         ) from exc
 
-    return shards, observed_rows
+    return shards, observed_rows, raw_input_rows, adapter_reports, rejected_records
 
 
 def acquire_source(
@@ -308,6 +335,7 @@ def acquire_source(
     downloader: Downloader | None = None,
     now: datetime | None = None,
     refresh: bool = False,
+    adapter: Any | None = None,
 ) -> SourceManifest:
     """Acquire ``source`` as parquet shards plus a provenance manifest.
 
@@ -319,6 +347,12 @@ def acquire_source(
     ``refresh=True`` ignores (and overwrites) any existing manifest — the
     documented escape hatch for re-admitting a source after a license
     review. Without it, an existing valid manifest always wins.
+
+    ``adapter`` (optional, duck-typed as the :class:`~src.data.adapters.base.Adapter`
+    protocol) converts every batch to unified :class:`DecisionExample`
+    records before the shard is encoded, so the shards can be read back with
+    :func:`src.data.core.parquet.read_parquet`. Without it the shards hold
+    raw source columns and need an adapter pass first.
     """
     if not isinstance(source, str) or not source.strip():
         raise AcquireError("source must be a non-empty string", field="source")
@@ -333,6 +367,10 @@ def acquire_source(
     ):
         raise AcquireError(
             f"rows_per_shard must be >= 1, got {rows_per_shard!r}", field="rows_per_shard"
+        )
+    if adapter is not None and not callable(getattr(adapter, "to_decision_example", None)):
+        raise AcquireError(
+            "adapter must expose a to_decision_example(rows) method", field="adapter"
         )
 
     out = Path(output_dir)
@@ -350,6 +388,13 @@ def acquire_source(
     existing = manifest_path(out)
     if not refresh and existing.is_file():
         manifest = load_manifest(existing)
+        requested_adapter = type(adapter).__name__ if adapter is not None else None
+        if manifest.adapter != requested_adapter:
+            raise AcquireError(
+                f"existing acquisition used adapter={manifest.adapter!r}, requested "
+                f"{requested_adapter!r}; rerun with refresh=True to change shard layout",
+                field="adapter",
+            )
         verify_manifest(manifest)
         return manifest
 
@@ -410,7 +455,13 @@ def acquire_source(
     tmp_dir = out / f".acquire-tmp-{uuid.uuid4().hex}"
     tmp_dir.mkdir(parents=True, exist_ok=False)
     try:
-        shard_records, observed_rows = _acquire_into_tmp(
+        (
+            shard_records,
+            observed_rows,
+            raw_input_rows,
+            adapter_reports,
+            rejected_records,
+        ) = _acquire_into_tmp(
             source=source,
             tmp_dir=tmp_dir,
             split=split,
@@ -419,6 +470,7 @@ def acquire_source(
             rows_per_shard=rows_per_shard,
             max_bytes=max_bytes,
             downloader=downloader,
+            adapter=adapter,
         )
 
         # Defense in depth: the cap is enforced before every shard is
@@ -465,6 +517,14 @@ def acquire_source(
             shard_sha256=shard_sha256,
             shard_bytes=shard_bytes,
             license_origin=resolution.origin,
+            adapter=type(adapter).__name__ if adapter is not None else None,
+            shard_layout="decision-example" if adapter is not None else "raw",
+            raw_input_rows=raw_input_rows,
+            rejected_rows=len(rejected_records),
+            adapter_report={
+                "per_shard": adapter_reports,
+                "rejected_records": rejected_records,
+            },
         )
         write_manifest(manifest, out)
         return manifest

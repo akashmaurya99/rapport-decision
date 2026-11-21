@@ -20,7 +20,12 @@ Token counting note: at this layer "tokens" means whitespace-delimited words
 512-token budget in Q5 is therefore approximate; the tokenizer enforces the
 exact budget at encode time (TASK-04). Q1's "<3-token option" is applied
 literally as written in the dataset strategy, including to single-word
-options.
+options — *except* for the families whose option lists are a fixed
+polarity/attribute vocabulary (see :data:`FIXED_OPTION_VOCABULARIES`). Those
+vocabularies are produced by the adapters, not authored by a human, so a
+one-token "Yes"/"No"/"safe"/"unsafe"/"helpfulness" is a complete, legitimate
+option. Short options outside the family's declared vocabulary are still
+rejected.
 """
 
 from __future__ import annotations
@@ -37,6 +42,17 @@ from .report import RejectionReport
 DEFAULT_MAX_TOKENS = 512
 #: Minimum whitespace-token count an option must carry (Q1).
 MIN_OPTION_TOKENS = 3
+
+#: Families with adapter-owned fixed option vocabularies. Q1 is skipped for
+#: an option whose (case-folded) text is declared here: these are structural
+#: polarity/attribute labels, never free-text author options. Adding a family
+#: here is an explicit claim that its adapter owns the option vocabulary.
+FIXED_OPTION_VOCABULARIES: dict[str, frozenset[str]] = {
+    "scoring": frozenset({"helpfulness", "correctness", "coherence"}),
+    "probability": frozenset({"yes", "no"}),
+    "abstention": frozenset({"answerable", "unanswerable"}),
+    "risk": frozenset({"safe", "unsafe"}),
+}
 
 # Q2 residue patterns: an HTML-ish tag, an entity reference, or markdown bold.
 _TAG_RESIDUE = re.compile(r"<[^>\n]{0,200}>")
@@ -67,9 +83,24 @@ def _iter_text_fields(example: DecisionExample) -> list[str]:
 
 
 def q1_short_option(example: DecisionExample) -> bool:
-    """Q1 — an option is empty or carries fewer than 3 whitespace tokens."""
+    """Q1 — an option is empty or carries fewer than 3 whitespace tokens.
+
+    Family-aware: fixed polarity/attribute vocabularies declared in
+    :data:`FIXED_OPTION_VOCABULARIES` are exempt, because the adapter (not a
+    human author) owns those exact option strings. A short option that is
+    *not* part of the family's declared vocabulary is still rejected.
+    """
+    exempt = FIXED_OPTION_VOCABULARIES.get(example.task_family, frozenset())
+
+    def ascii_fold(text: str) -> str:
+        # Unicode casefold maps long-s (ſ) to ASCII s and would admit option
+        # spellings no adapter emits. Only ASCII case is normalized here.
+        return "".join(char.lower() if "A" <= char <= "Z" else char for char in text.strip())
+
     return any(
-        len(option.text.split()) < MIN_OPTION_TOKENS for option in example.options
+        len(option.text.split()) < MIN_OPTION_TOKENS
+        and ascii_fold(option.text) not in exempt
+        for option in example.options
     )
 
 

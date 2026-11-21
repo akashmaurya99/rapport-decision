@@ -103,7 +103,7 @@ from typing import Any, ClassVar, Sequence
 import numpy as np
 
 from src.data.core.schema import DecisionExample
-from src.data.splits.fingerprint import is_sha256_hex
+from src.data.splits.fingerprint import is_sha256_hex, membership_fingerprint
 from src.data.splits.manifest import read_manifest
 from src.evaluation.metrics import (
     MetricRecord,
@@ -512,15 +512,17 @@ def _partition(
     for row in rows:
         family = row.task_family
         n_options = len(row.options)
-        if family == "abstention":
-            abstention.append(row)
-            continue
-        if family not in SCORED_FAMILIES:
+        if family not in SCORED_FAMILIES and family != "abstention":
             skipped[family] = skipped.get(family, 0) + 1
             continue
         chosen = row.chosen_index
         if chosen is None:
-            skipped["no-chosen-index"] = skipped.get("no-chosen-index", 0) + 1
+            # An unlabeled abstention row is scored with n_scored=0 (documented);
+            # but an INVALID index must never be silently skipped below.
+            if family != "abstention":
+                skipped["no-chosen-index"] = skipped.get("no-chosen-index", 0) + 1
+            if family == "abstention":
+                abstention.append(row)
             continue
         chosen_int = _require_index(chosen, "chosen_index")
         if not 0 <= chosen_int < n_options:
@@ -528,7 +530,10 @@ def _partition(
                 f"chosen_index {chosen_int} out of range [0, {n_options}) "
                 f"(example_id={row.example_id[:16]}…)"
             )
-        scored.append(row)
+        if family == "abstention":
+            abstention.append(row)
+        else:
+            scored.append(row)
     return scored, skipped, abstention
 
 
@@ -596,14 +601,16 @@ def _score_abstention(rows: Sequence[DecisionExample]) -> AbstentionRandomScore 
     for row in rows:
         chosen = row.chosen_index
         if chosen is None:
-            continue
-        try:
-            chosen_int = _require_index(chosen, "chosen_index")
-        except BaselineInputError:
-            continue
+            continue  # documented: unlabeled rows are counted but not scored
+        # _partition already validated these; never silently skip an invalid
+        # abstention index — that would quietly shrink the scored cohort.
+        chosen_int = _require_index(chosen, "chosen_index")
         n_options = len(row.options)
         if not 0 <= chosen_int < n_options:
-            continue
+            raise BaselineInputError(
+                f"chosen_index {chosen_int} out of range [0, {n_options}) "
+                f"(example_id={row.example_id[:16]}…)"
+            )
         gold.append(chosen_int)
         preds.append(rng.randrange(n_options))
         expected += 1.0 / n_options
@@ -686,6 +693,20 @@ class BaselineRunner(ABC):
                         f"the {name} split of the manifest being echoed"
                     )
             splits[name] = materialized
+
+        # Echoing a well-formed digest is not provenance: recompute it from the
+        # actual row membership and refuse a mismatch. This catches a caller
+        # passing a fingerprint for a different record stream.
+        actual_fingerprint = membership_fingerprint(
+            (row.example_id, row.split)
+            for name in ("train", "dev", "test")
+            for row in splits[name]
+        )
+        if actual_fingerprint != fingerprint:
+            raise BaselineInputError(
+                "split_manifest_fingerprint does not match the actual (example_id, split) "
+                f"membership: expected {fingerprint}, computed {actual_fingerprint}"
+            )
 
         scored_train, skipped_train, _ = _partition(splits["train"])
         scored_dev, skipped_dev, abst_dev = _partition(splits["dev"])

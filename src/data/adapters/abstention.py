@@ -97,7 +97,7 @@ class AbstentionAdapter:
     never pooled."""
 
     name = "abstention"
-    source = "AbstentionBench"
+    source = "AbstentionBench-derived"
     license = "AbstentionBench (arXiv 2506.09038) — see paper"
     task_family = "abstention"
     default_split = "train"

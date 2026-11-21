@@ -7,14 +7,14 @@
 arm: starter
 title: 55k starter run (Stage B)
 question: does the full pipeline train end to end at 55k scale?
-init: bge-small            # BAAI/bge-small-en-v1.5; heads random
+init: scratch            # this architecture trains from scratch; a pretrained-trunk loader is not implemented
 variant: compact           # RAPPORT-C — 12 layers x 384 hidden, 33.46M (Y11-eligible)
 layers: 12
 hidden: 384
 readout: cosine
 weight_mode: learned       # floor 0.05, cap 4.0
 head_only: false
-ordering: curriculum
+ordering: fingerprint       # deterministic fingerprint order; the curriculum arm is not implemented
 mixture: starter           # packaged preset, counts asserted within 1% of docs/dataset-strategy.md §6
 mixture_rows: 55000
 max_length: 512

@@ -9,14 +9,14 @@
 arm: A3
 title: depth
 question: what does capacity buy?
-init: bge-small
+init: scratch            # this architecture trains from scratch; a pretrained-trunk loader is not implemented
 variant: compact           # default arm; alternatives below
 layers: 12
 hidden: 384
 readout: cosine
 weight_mode: learned
 head_only: false
-ordering: curriculum
+ordering: fingerprint       # deterministic fingerprint order; the curriculum arm is not implemented
 mixture: starter           # 55k — ablations run on the starter; acceptance re-runs the winner
 mixture_rows: 55000
 seeds: [13, 29, 47]

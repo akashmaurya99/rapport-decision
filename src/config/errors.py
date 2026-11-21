@@ -73,6 +73,17 @@ class ManifestError(RapportError):
     code = "MANIFEST_ERROR"
 
 
+class ManifestRunIdError(ManifestError):
+    """A run id is empty, non-portable or escapes the runs directory.
+
+    Run ids become a single directory name under ``runs/``; anything that can
+    traverse, split into components or change meaning across platforms is
+    rejected before any filesystem operation.
+    """
+
+    code = "MANIFEST_INVALID_RUN_ID"
+
+
 class ManifestWriteError(ManifestError):
     """The manifest file could not be written to disk."""
 

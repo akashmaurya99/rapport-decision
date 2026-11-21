@@ -10,14 +10,14 @@
 arm: A7
 title: ordering
 question: is the curriculum earning its complexity?
-init: bge-small
+init: scratch            # this architecture trains from scratch; a pretrained-trunk loader is not implemented
 variant: compact           # ultra 6/320 | compact 12/384 (recommended) | large 16/448
 layers: 12
 hidden: 384
 readout: cosine
 weight_mode: learned
 head_only: false
-ordering: curriculum       # this arm; see header for the curriculum contract
+ordering: fingerprint       # deterministic fingerprint order; the curriculum arm is not implemented
 ordering_alternates: [uniform]
 mixture: starter           # 55k — ablations run on the starter; acceptance re-runs the winner
 mixture_rows: 55000

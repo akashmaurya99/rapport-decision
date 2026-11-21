@@ -85,6 +85,13 @@ def test_non_list_categories_rejected():
     assert result.rejected[0].reason_code == "ADAPTOR_BAD_TYPE"
 
 
+def test_case_variant_of_the_same_category_is_deduplicated():
+    row = aegis_row(("Violence", "violence"))
+    result = RiskAdapter().to_decision_example([row])
+    assert len(result.examples) == 1
+    assert result.examples[0].risk_labels == ("Violence",)
+
+
 def test_non_string_label_rejected():
     row = aegis_row(("hate", 42))  # type: ignore[arg-type]
     result = RiskAdapter().to_decision_example([row])

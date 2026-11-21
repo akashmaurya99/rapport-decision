@@ -30,7 +30,7 @@ def test_auxiliary_train_row_maps_into_choice_family():
     assert len(result.examples) == 1
     example = result.examples[0]
     assert example.task_family == "choice"
-    assert example.source == "cais/mmlu"
+    assert example.source == "cais/mmlu#auxiliary_train"
     assert example.license == "MIT"
     assert example.group_id == "mmlu-aux-1"
     assert example.split == "train"

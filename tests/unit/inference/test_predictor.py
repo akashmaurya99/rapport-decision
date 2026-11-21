@@ -168,6 +168,68 @@ def test_confidence_equals_max_probability(predictor):
     assert result.confidence == pytest.approx(max(result.probabilities))
 
 
+def test_platt_does_not_flip_the_choice(model, tokenizer):
+    """Platt correctness must never re-rank the options (a=0, b=-3, logits [4,0]).
+
+    The calibrated correctness is ``sigmoid(-3) ~= 0.047`` — far below the
+    raw max probability — yet the chosen index must remain the raw argmax 0.
+    """
+    import math
+
+    from src.calibration.platt import apply_platt_to_distribution
+
+    # (1) Direct helper: probabilities keep the raw argmax; confidence is the
+    #     separate Platt correctness scalar.
+    raw = [1.0 / (1.0 + math.exp(-4.0)), 1.0 / (1.0 + math.exp(0.0))]
+    probs, cal = apply_platt_to_distribution(raw, 0.0, -3.0)
+    assert max(range(len(probs)), key=probs.__getitem__) == 0
+    assert sum(probs) == pytest.approx(1.0)
+    assert cal == pytest.approx(1.0 / (1.0 + math.exp(3.0)))
+    assert cal != pytest.approx(max(probs))
+
+    # (2) Calibration map apply: same guarantees.
+    platt_map = CalibrationMap(
+        schema_version=1,
+        folds=0,
+        pooled=CalibrationEntry(
+            bucket_key="pooled",
+            method="platt",
+            temperature=1.0,
+            n_items=60,
+            ece_before=0.1,
+            ece_after=0.05,
+            folds=0,
+            platt={"a": 0.0, "b": -3.0},
+        ),
+        buckets={},
+    )
+    calibrated = platt_map.apply([4.0, 0.0])
+    assert max(range(len(calibrated.probabilities)),
+               key=calibrated.probabilities.__getitem__) == 0
+    assert calibrated.confidence == pytest.approx(1.0 / (1.0 + math.exp(3.0)))
+    assert calibrated.abstain is True  # 0.047 < 0.75
+
+    # (3) Predictor end-to-end: force the model to emit logits [4, 0].
+    predictor = Predictor(model, tokenizer, calibration_map=platt_map,
+                          abstention_policy=_never_abstain())
+
+    class _Out:
+        choice_logits = torch.tensor([[4.0, 0.0]])
+        scores = torch.tensor([[0.5, 0.5]])
+        risk = torch.zeros(1, 8)
+
+    original_forward = predictor.model.forward
+    predictor.model.forward = lambda *args, **kwargs: _Out()  # type: ignore[method-assign]
+    try:
+        result = predictor.predict(_request())
+    finally:
+        predictor.model.forward = original_forward  # type: ignore[method-assign]
+    assert result.chosen_index == 0
+    assert result.probabilities[0] > result.probabilities[1]
+    assert result.confidence == pytest.approx(1.0 / (1.0 + math.exp(3.0)))
+    assert result.confidence != pytest.approx(max(result.probabilities))
+
+
 @pytest.mark.parametrize("n_options", [2, 3, 5, 6, 8])
 def test_every_supported_option_count_predicts(predictor, n_options):
     options = tuple(f"option {i}" for i in range(n_options))
@@ -379,12 +441,21 @@ def test_predictor_reuses_the_single_model_instance(model, tokenizer):
 
 
 def test_config_path_builds_a_model_and_predicts(tokenizer, tmp_path):
+    weights = tmp_path / "weights.pt"
+    torch.save(RapportModel(RapportConfig.ultra()).state_dict(), weights)
     config_path = tmp_path / "model.yaml"
-    config_path.write_text("variant: ultra\n", encoding="utf-8")
+    config_path.write_text(f"variant: ultra\nweights_path: {weights!s}\n", encoding="utf-8")
     predictor = Predictor(config_path, tokenizer)
     result = predictor.predict(_request())
     assert result.temperature == 1.0
     assert len(result.probabilities) == 2
+
+
+def test_config_path_requires_trained_weights(tokenizer, tmp_path):
+    config_path = tmp_path / "model.yaml"
+    config_path.write_text("variant: ultra\n", encoding="utf-8")
+    with pytest.raises(PredictorConfigError, match="weights_path is required"):
+        Predictor(config_path, tokenizer)
 
 
 def test_config_path_rejects_an_unknown_variant(tokenizer, tmp_path):

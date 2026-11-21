@@ -22,8 +22,8 @@ STARTER_COUNTS = {
     "risk": 6_800,
 }
 STARTER_SOURCES = {
-    ("preference", "Anthropic/hh-rlhf"): 16_000,
-    ("preference", "nvidia/HelpSteer2"): 4_000,
+    # HelpSteer2 is scored only; PreferenceAdapter cannot consume its rows.
+    ("preference", "Anthropic/hh-rlhf"): 20_000,
     ("scoring", "nvidia/HelpSteer2"): 5_000,
     ("choice", "cais/mmlu#auxiliary_train"): 12_000,
     ("probability", "truthfulqa/truthful_qa"): 1_600,
@@ -42,8 +42,8 @@ FULL_COUNTS = {
     "scoring": 11_000,
 }
 FULL_SOURCES = {
-    ("preference", "Anthropic/hh-rlhf"): 23_000,
-    ("preference", "nvidia/HelpSteer2"): 10_000,
+    # HelpSteer2 is scored only; its former preference allocation moved to HH-RLHF.
+    ("preference", "Anthropic/hh-rlhf"): 33_000,
     ("choice", "cais/mmlu#auxiliary_train"): 30_000,
     ("risk", "nvidia/Aegis-AI-Content-Safety-Dataset-2.0"): 18_000,
     ("abstention", "AbstentionBench-derived"): 12_000,
@@ -88,9 +88,10 @@ class TestStarterPreset:
         for key, rows in STARTER_SOURCES.items():
             assert key in flat, f"missing starter allocation {key}"
             assert within_one_percent(flat[key], rows), f"{key}: {flat[key]} vs documented {rows}"
-        # HelpSteer2 starter usage: 4,000 preference + 5,000 scoring = 9,000 ≤ 21,362
-        assert declaration.counts()["preference"]["nvidia/HelpSteer2"] == 4_000
+        # HelpSteer2 starter usage: scoring only (5,000 ≤ 21,362).
+        assert "nvidia/HelpSteer2" not in declaration.counts()["preference"]
         assert declaration.counts()["scoring"]["nvidia/HelpSteer2"] == 5_000
+        assert declaration.counts()["preference"]["Anthropic/hh-rlhf"] == 20_000
 
     def test_sampling_reproduces_an_identical_order_for_a_fixed_seed(self):
         declaration = load_preset("starter")
@@ -126,14 +127,11 @@ class TestFullPreset:
         for key, rows in FULL_SOURCES.items():
             assert key in flat, f"missing full allocation {key}"
             assert within_one_percent(flat[key], rows), f"{key}: {flat[key]} vs documented {rows}"
-        # HelpSteer2 full usage: 10,000 preference + 11,000 scoring = 21,000 ≤ 21,362
-        assert (
-            declaration.counts()["preference"]["nvidia/HelpSteer2"]
-            + declaration.counts()["scoring"]["nvidia/HelpSteer2"]
-            == 21_000
-        )
-        # HH-RLHF 23,000 of 169,352 ✓
-        assert declaration.counts()["preference"]["Anthropic/hh-rlhf"] == 23_000
+        # HelpSteer2 full usage: scoring only (11,000 ≤ 21,362).
+        assert "nvidia/HelpSteer2" not in declaration.counts()["preference"]
+        assert declaration.counts()["scoring"]["nvidia/HelpSteer2"] == 11_000
+        # HH-RLHF 33,000 of 169,352 ✓
+        assert declaration.counts()["preference"]["Anthropic/hh-rlhf"] == 33_000
         # TruthfulQA 1,600 of 1,634 ✓
         assert declaration.counts()["probability"]["truthfulqa/truthful_qa"] == 1_600
 

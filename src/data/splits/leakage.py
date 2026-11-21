@@ -162,16 +162,14 @@ def _document_tokens(example: DecisionExample) -> list[str]:
     return tokens
 
 
-def find_thirteen_gram_overlaps(
-    examples: Sequence[DecisionExample],
-    *,
-    n_gram: int = N_GRAM,
-) -> dict[str, int]:
-    """Count shared exact n-grams per split pair.
+def _gram_index(
+    examples: Sequence[DecisionExample], *, n_gram: int
+) -> tuple[dict[str, set[int]], dict[int, set[int]]]:
+    """Build per-split and per-example sets of n-gram hash keys.
 
-    Returns a mapping like ``{"dev/test": 3}`` containing only pairs with at
-    least one shared gram. The n-gram spans the normalized goal, state and
-    option texts of each example.
+    Keys are 128-bit Rabin-Karp hashes of the exact token sequence spanning
+    goal, state and option texts. Per-example sets are indexed by position so
+    duplicate ids cannot hide an offender.
     """
     if not isinstance(n_gram, int) or isinstance(n_gram, bool) or n_gram < 1:
         raise SplitInputError(
@@ -180,12 +178,14 @@ def find_thirteen_gram_overlaps(
         )
     intern: dict[str, int] = {}
     per_split: dict[str, set[int]] = {name: set() for name in _SPLIT_NAMES}
+    per_example: dict[int, set[int]] = {}
     mod = 1 << 64
     pow_a = pow(_BASE_A, n_gram, mod)
     pow_b = pow(_BASE_B, n_gram, mod)
-    for example in examples:
+    for position, example in enumerate(examples):
         _validate_split_name(example.split)
         target = per_split[example.split]
+        own = per_example.setdefault(position, set())
         ids: list[int] = []
         for token in _document_tokens(example):
             token_id = intern.get(token)
@@ -203,7 +203,24 @@ def find_thirteen_gram_overlaps(
                 hash_a = (hash_a - lead * pow_a) & _MASK64
                 hash_b = (hash_b - lead * pow_b) & _MASK64
             if index >= n_gram - 1:
-                target.add((hash_a << 64) | hash_b)
+                key = (hash_a << 64) | hash_b
+                target.add(key)
+                own.add(key)
+    return per_split, per_example
+
+
+def find_thirteen_gram_overlaps(
+    examples: Sequence[DecisionExample],
+    *,
+    n_gram: int = N_GRAM,
+) -> dict[str, int]:
+    """Count shared exact n-grams per split pair.
+
+    Returns a mapping like ``{"dev/test": 3}`` containing only pairs with at
+    least one shared gram. The n-gram spans the normalized goal, state and
+    option texts of each example.
+    """
+    per_split, _ = _gram_index(examples, n_gram=n_gram)
     overlaps: dict[str, int] = {}
     for i, left in enumerate(_SPLIT_NAMES):
         for right in _SPLIT_NAMES[i + 1 :]:
@@ -211,6 +228,32 @@ def find_thirteen_gram_overlaps(
             if shared:
                 overlaps[split_pair_key(left, right)] = shared
     return overlaps
+
+
+def find_thirteen_gram_offender_ids(
+    examples: Sequence[DecisionExample],
+    *,
+    n_gram: int = N_GRAM,
+) -> frozenset[str]:
+    """Ids of the rows that contribute a cross-split exact n-gram.
+
+    Used by the split router to *report* an exclusion bucket instead of
+    aborting the whole build on boilerplate that appears in more than one
+    split (a fixed directive shared by every adapter row, for example).
+    Callers must still assert that no overlap remains in the emitted rows.
+    """
+    per_split, per_example = _gram_index(examples, n_gram=n_gram)
+    shared: set[int] = set()
+    for i, left in enumerate(_SPLIT_NAMES):
+        for right in _SPLIT_NAMES[i + 1 :]:
+            shared |= per_split[left] & per_split[right]
+    if not shared:
+        return frozenset()
+    return frozenset(
+        examples[position].example_id
+        for position, grams in per_example.items()
+        if grams & shared
+    )
 
 
 def assert_no_thirteen_gram_overlap(

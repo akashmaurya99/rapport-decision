@@ -66,6 +66,23 @@ def test_should_abstain_boundary():
         policy.should_abstain(-0.1)
 
 
+def test_reversed_utilities_use_correct_inequality():
+    """When u_correct < u_wrong the answer/abstain inequality reverses.
+
+    EU(answer) = p·u_c + (1-p)·u_w. With u_c=1, u_w=3, u_a=2:
+    EU = 3 - 2p, which is < 2 (abstain) only when p > 0.5. The crossover
+    threshold is still (2-3)/(1-3) = 0.5, but the abstain side flips.
+    """
+    policy = AbstentionPolicy(u_correct=1.0, u_wrong=3.0, u_abstain=2.0)
+    assert policy.threshold == pytest.approx(0.5, abs=1e-12)
+    assert policy.should_abstain(0.4) is False
+    assert policy.should_abstain(0.6) is True
+    assert policy.should_abstain(0.5) is False  # strict crossover: EU(answer) == u_a
+    # Default triple must still yield exactly 0.75.
+    assert AbstentionPolicy().should_abstain(0.749) is True
+    assert AbstentionPolicy().should_abstain(0.75) is False
+
+
 def test_policy_round_trip():
     policy = AbstentionPolicy(2.0, -4.0, 0.5)
     payload = policy.to_dict()
@@ -96,13 +113,18 @@ def test_risk_coverage_curve_hand_computed():
     json.dumps(curve)
 
 
-def test_risk_coverage_curve_stable_ties():
+def test_risk_coverage_curve_ties_are_order_invariant():
     confidences = [0.5, 0.5, 0.5]
     correctness = [1, 0, 0]
     curve = risk_coverage_curve(confidences, correctness)
-    # Ties keep input order: the y=1 item is retained first.
-    assert curve["selective_accuracy"][0] == 1.0
-    assert curve["selective_accuracy"][-1] == pytest.approx(1 / 3)
+    # A single tied block is one operating point: overall accuracy 1/3, AURC 2/3.
+    assert curve["selective_accuracy"] == [pytest.approx(1 / 3)]
+    assert curve["aurc"] == pytest.approx(2 / 3)
+    assert len(curve["points"]) == 1
+    assert curve["points"][0]["retained"] == 3
+    # Permuting the tied rows must not change anything.
+    assert risk_coverage_curve([0.5, 0.5, 0.5], [0, 1, 0]) == curve
+    assert risk_coverage_curve([0.5, 0.5, 0.5], [0, 0, 1]) == curve
 
 
 def test_risk_coverage_curve_invalid_input():

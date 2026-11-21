@@ -21,6 +21,13 @@ Required on every manifest (validated in ``__post_init__`` and on load):
 
 Also recorded: ``seed``, ``totals`` per split, ``ood_rows`` (rows of the OOD
 source, all assigned to the evaluation side) and ``ratios``.
+
+Optional audit fields ``excluded_thirteen_gram_rows`` and
+``excluded_thirteen_gram_ids`` record rows the router quarantined because
+they contributed a cross-split exact 13-gram. Emitted splits are guaranteed
+free of such overlaps; a non-zero count is a *reported exclusion*, not a
+silent label choice. They default to zero/empty and are optional on load so
+older manifests stay readable.
 """
 
 from __future__ import annotations
@@ -46,6 +53,12 @@ DEFAULT_DEDUP_THRESHOLD = 0.9
 SPLIT_NAMES = ("train", "dev", "test")
 #: Target row ratios within each family (stratified assignment).
 RATIOS = {"train": 0.70, "dev": 0.15, "test": 0.15}
+
+#: Newly introduced audit fields; accepted on load but not required, so
+#: manifests written before the 13-gram exclusion policy stay readable.
+_OPTIONAL_KEYS = frozenset(
+    {"excluded_thirteen_gram_rows", "excluded_thirteen_gram_ids"}
+)
 
 _REQUIRED_KEYS = (
     "fingerprint",
@@ -181,6 +194,8 @@ class SplitManifest:
     totals: dict[str, int] = field(default_factory=lambda: {name: 0 for name in SPLIT_NAMES})
     ood_rows: int = 0
     ratios: dict[str, float] = field(default_factory=ratios_dict)
+    excluded_thirteen_gram_rows: int = 0
+    excluded_thirteen_gram_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not is_sha256_hex(self.fingerprint):
@@ -223,6 +238,36 @@ class SplitManifest:
                 f"ood_rows must be a non-negative integer, got {self.ood_rows!r}",
                 field="ood_rows",
             )
+        excluded = self.excluded_thirteen_gram_rows
+        if not _is_non_bool_int(excluded) or excluded < 0:
+            raise ManifestFieldError(
+                f"excluded_thirteen_gram_rows must be a non-negative integer, "
+                f"got {excluded!r}",
+                field="excluded_thirteen_gram_rows",
+            )
+        ids = self.excluded_thirteen_gram_ids
+        if isinstance(ids, (str, bytes)) or not isinstance(ids, (list, tuple)):
+            raise ManifestFieldError(
+                "excluded_thirteen_gram_ids must be a list/tuple of strings",
+                field="excluded_thirteen_gram_ids",
+            )
+        if any(not isinstance(item, str) for item in ids):
+            raise ManifestFieldError(
+                "excluded_thirteen_gram_ids must contain only strings",
+                field="excluded_thirteen_gram_ids",
+            )
+        if len(set(ids)) != len(ids):
+            raise ManifestFieldError(
+                "excluded_thirteen_gram_ids contains duplicates",
+                field="excluded_thirteen_gram_ids",
+            )
+        if excluded != len(ids):
+            raise ManifestFieldError(
+                f"excluded_thirteen_gram_rows is {excluded} but "
+                f"excluded_thirteen_gram_ids has {len(ids)} entries",
+                field="excluded_thirteen_gram_rows",
+            )
+        object.__setattr__(self, "excluded_thirteen_gram_ids", tuple(ids))
         object.__setattr__(
             self, "ood_source", _validate_source(self.ood_source, field_name="ood_source")
         )
@@ -250,6 +295,8 @@ class SplitManifest:
             "totals": dict(self.totals),
             "ood_rows": self.ood_rows,
             "ratios": dict(self.ratios),
+            "excluded_thirteen_gram_rows": self.excluded_thirteen_gram_rows,
+            "excluded_thirteen_gram_ids": list(self.excluded_thirteen_gram_ids),
         }
 
     @classmethod
@@ -258,7 +305,7 @@ class SplitManifest:
             raise ManifestFieldError(
                 f"expected a mapping of manifest field to value, got {type(data).__name__}"
             )
-        unknown = sorted(set(data) - set(_REQUIRED_KEYS))
+        unknown = sorted(set(data) - set(_REQUIRED_KEYS) - _OPTIONAL_KEYS)
         if unknown:
             raise ManifestFieldError(
                 f"undeclared field(s): {', '.join(unknown)}",
@@ -289,6 +336,8 @@ class SplitManifest:
             totals=data["totals"],
             ood_rows=data["ood_rows"],
             ratios=data["ratios"],
+            excluded_thirteen_gram_rows=data.get("excluded_thirteen_gram_rows", 0),
+            excluded_thirteen_gram_ids=tuple(data.get("excluded_thirteen_gram_ids", ())),
         )
 
     # ------------------------------------------------------------------ json

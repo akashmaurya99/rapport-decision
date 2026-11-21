@@ -8,9 +8,10 @@ The map is JSON-serializable and round-trips exactly:
 ``CalibrationMap.from_dict(m.to_dict()) == m`` for any map produced by this
 package (all stored values are finite doubles, ints, strings and bools).
 ``xstest_used_for_fitting`` is hardcoded ``False`` — there is no argument
-anywhere in this package that accepts XSTest rows, and any non-``false``
-value found in a foreign file is coerced back to ``False`` on load (the
-flag is an audit marker, not user data).
+anywhere in this package that accepts XSTest rows. A non-``false`` value found
+in a foreign file is rejected with :class:`CalibrationMapError` on load (the
+flag is an audit marker, never silently coerced). Likewise a malformed frozen
+``abstention`` policy is rejected rather than replaced with the default.
 
 ``apply`` produces calibrated probabilities, the calibrated confidence, the
 abstain decision (from the utilities frozen into the map, defaulting to the
@@ -167,7 +168,17 @@ class CalibrationEntry:
 
 @dataclass(frozen=True)
 class CalibratedOutput:
-    """Result of applying the map to one item's logits."""
+    """Result of applying the map to one item's logits.
+
+    ``probabilities`` is the option distribution whose argmax is the raw
+    choice-logit argmax (the decision is never changed by calibration).
+    ``confidence`` is the calibrated *correctness* probability of that top
+    option: for temperature buckets it equals ``max(probabilities)``; for Platt
+    buckets it is the Platt scalar ``sigmoid(a·logit(max_probs) + b)`` and is
+    deliberately **not** ``max(probabilities)``. The abstention decision and
+    any downstream risk/abstention logic must consume ``confidence``, not the
+    categorical maximum.
+    """
 
     probabilities: list[float]
     confidence: float
@@ -218,9 +229,16 @@ class CalibrationMap:
                 raise CalibrationMapError(
                     f"buckets[{key!r}] carries bucket_key {entry.bucket_key!r}"
                 )
-        # Audit integrity: the flag can never be true from this package.
+        # Audit integrity: XSTest must never be used for fitting. A true flag
+        # is tampering and is rejected loudly — never silently rewritten.
         if self.xstest_used_for_fitting:
-            object.__setattr__(self, "xstest_used_for_fitting", False)
+            raise CalibrationMapError(
+                "xstest_used_for_fitting=true is forbidden: XSTest rows must never "
+                "be used for calibration fitting"
+            )
+        # A frozen abstention policy is audited data: reject a malformed policy
+        # rather than silently replacing it with the default 0.75 policy.
+        self._validated_abstention_policy()
 
     # ------------------------------------------------------------------
     # Serialization
@@ -271,6 +289,12 @@ class CalibrationMap:
                     )
                 risk_thresholds = {str(k): dict(v) for k, v in risk_thresholds.items()}
             skipped = tuple(str(k) for k in data.get("skipped_buckets", ()))
+            xstest_flag = data.get("xstest_used_for_fitting", False)
+            if xstest_flag:
+                raise CalibrationMapError(
+                    "xstest_used_for_fitting=true in serialized map: XSTest rows must "
+                    "never be used for calibration fitting"
+                )
             return cls(
                 schema_version=int(data["schema_version"]),
                 folds=int(data["folds"]),
@@ -280,7 +304,7 @@ class CalibrationMap:
                 fitted_on=str(data.get("fitted_on", "dev")),
                 run_id=(None if data.get("run_id") is None else str(data["run_id"])),
                 group_aware=bool(data.get("group_aware", True)),
-                xstest_used_for_fitting=False,
+                xstest_used_for_fitting=bool(xstest_flag),
                 abstention=dict(abstention),
                 risk_thresholds=risk_thresholds,
             )
@@ -301,13 +325,22 @@ class CalibrationMap:
         frozen = {str(k): dict(v) for k, v in risk_thresholds.items()}
         return replace(self, risk_thresholds=frozen)
 
-    def abstention_policy(self) -> AbstentionPolicy:
-        """Reconstruct the frozen abstention policy (defaults to declared triple)."""
-        payload = self.abstention or {}
+    def _validated_abstention_policy(self) -> AbstentionPolicy:
+        """Validate and reconstruct the frozen policy; never silently default."""
         try:
-            return AbstentionPolicy.from_dict(payload)
-        except CalibrationInputError:
-            return AbstentionPolicy()
+            return AbstentionPolicy.from_dict(self.abstention or {})
+        except (CalibrationInputError, TypeError, ValueError) as exc:
+            raise CalibrationMapError(
+                f"malformed frozen abstention policy: {exc}"
+            ) from exc
+
+    def abstention_policy(self) -> AbstentionPolicy:
+        """Reconstruct the frozen abstention policy.
+
+        A malformed frozen policy is a typed error (:class:`CalibrationMapError`)
+        — it is never silently replaced with the default 0.75 policy.
+        """
+        return self._validated_abstention_policy()
 
     def entry_for(self, bucket_key: str) -> CalibrationEntry:
         try:
@@ -332,6 +365,12 @@ class CalibrationMap:
 
         ``bucket_key=None`` selects the pooled entry. An unknown bucket raises
         under ``strict=True`` (default) and falls back to pooled otherwise.
+
+        The returned :attr:`CalibratedOutput.probabilities` always keep the raw
+        logit argmax (calibration never flips the decision). For Platt buckets
+        the returned ``confidence`` is the calibrated correctness probability —
+        a separate scalar, not ``max(probabilities)`` (see
+        :class:`CalibratedOutput`).
         """
         if bucket_key is not None:
             parse_bucket_key(bucket_key)  # validate format; raises on malformed keys

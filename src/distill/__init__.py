@@ -30,6 +30,8 @@ from .cache import (
     SoftLabelCacheResult,
     SoftLabelEntry,
     build_soft_label_cache,
+    entry_filename,
+    index_key,
     sanitize_teacher_id,
     template_hash,
 )
@@ -92,6 +94,8 @@ __all__ = [
     "distillation_loss",
     "entropy_exclusion_mask",
     "entropy_from_logprobs",
+    "entry_filename",
+    "index_key",
     "load_local_teacher",
     "percentile_linear",
     "render_prompt",

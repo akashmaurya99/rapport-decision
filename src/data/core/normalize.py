@@ -506,13 +506,16 @@ def _risk_labels(value: Any, errors: list[DataError]) -> None:
             )
             continue
         label = unicodedata.normalize("NFC", item.strip())
-        if label in seen:
+        # Category names are case-insensitive identifiers: "Violence" and
+        # "violence" name the same category and must not both occupy slots.
+        key = label.casefold()
+        if key in seen:
             errors.append(
                 RiskLabelInvalidError(
                     f"risk label {label!r} appears more than once", field="risk_labels"
                 )
             )
-        seen.add(label)
+        seen.add(key)
 
 
 def _example_id(

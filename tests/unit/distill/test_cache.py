@@ -15,6 +15,8 @@ from src.distill import (
     DEFAULT_CACHE_ROOT,
     DistillOptions,
     build_soft_label_cache,
+    entry_filename,
+    index_key,
     sanitize_teacher_id,
     template_hash,
 )
@@ -66,8 +68,11 @@ def test_first_invocation_calls_teacher_and_writes_cache(tmp_path, example_facto
     assert result.cache_hit_rate == 0.0
     teacher_dir = Path(result.cache_dir)
     assert teacher_dir == tmp_path / "teacher_stub-1.7B"
+    template = "Goal: {goal}\nAnswer:"
     for example in examples:
-        entry_path = teacher_dir / f"{example.example_id}.json"
+        entry_path = teacher_dir / entry_filename(
+            example.example_id, template_hash(template)
+        )
         payload = json.loads(entry_path.read_text("utf-8"))
         assert payload["version"] == CACHE_VERSION
         assert payload["teacher_id"] == "teacher/stub-1.7B"
@@ -76,7 +81,9 @@ def test_first_invocation_calls_teacher_and_writes_cache(tmp_path, example_facto
         assert all(isinstance(v, float) for v in payload["logprobs"])
         assert payload["payload_hash"]
     index = json.loads((teacher_dir / "index.json").read_text("utf-8"))
-    assert set(index["entries"]) == {e.example_id for e in examples}
+    assert set(index["entries"]) == {
+        index_key(template_hash(template), e.example_id) for e in examples
+    }
 
 
 def test_second_invocation_performs_zero_teacher_forwards(tmp_path, example_factory,
@@ -124,6 +131,41 @@ def test_key_covers_template_hash_and_teacher_id(tmp_path, example_factory,
     assert Path(result.cache_dir).name == "other-teacher"
 
 
+def test_template_a_b_a_keeps_hits_instead_of_thrashing(
+    tmp_path, example_factory, stub_teacher_factory
+) -> None:
+    examples = _three_examples(example_factory)
+    template_a = "template A: {goal}\n{state}\n{options}"
+    template_b = "template B: {goal}\n{state}\n{options}"
+
+    first = build_soft_label_cache(
+        examples, "stub", template_a,
+        DistillOptions(cache_dir=tmp_path, teacher=stub_teacher_factory([1.0, 0.0, -1.0])),
+    )
+    assert first.teacher_forwards == 3
+
+    second = build_soft_label_cache(
+        examples, "stub", template_b,
+        DistillOptions(cache_dir=tmp_path, teacher=stub_teacher_factory([2.0, 1.0, 0.0])),
+    )
+    assert second.teacher_forwards == 3
+    assert second.hits == 0
+
+    third_stub = stub_teacher_factory([9.0, 9.0, 9.0])
+    third = build_soft_label_cache(
+        examples, "stub", template_a,
+        DistillOptions(cache_dir=tmp_path, teacher=third_stub),
+    )
+    assert third.teacher_forwards == 0
+    assert third_stub.calls == 0
+    assert third.hits == 3
+    assert third.cache_hit_rate == 1.0
+    assert all(
+        third.labels[e.example_id].logprobs == first.labels[e.example_id].logprobs
+        for e in examples
+    )
+
+
 def test_corrupt_entry_is_recomputed_once_and_new_hash_recorded(
     tmp_path, example_factory, stub_teacher_factory
 ) -> None:
@@ -135,7 +177,9 @@ def test_corrupt_entry_is_recomputed_once_and_new_hash_recorded(
     assert first.teacher_forwards == 3
 
     target = examples[0]
-    entry_path = Path(first.cache_dir) / f"{target.example_id}.json"
+    entry_path = Path(first.cache_dir) / entry_filename(
+        target.example_id, template_hash(template)
+    )
     payload = json.loads(entry_path.read_text("utf-8"))
     payload["logprobs"][0] = 99.0  # corrupt the payload, keep the old hash
     entry_path.write_text(json.dumps(payload), "utf-8")
@@ -167,7 +211,11 @@ def test_unreadable_cache_file_is_a_miss_not_an_error(tmp_path, example_factory,
     template = "Goal: {goal}\nAnswer:"
     options = DistillOptions(cache_dir=tmp_path, teacher=stub_teacher_factory())
     build_soft_label_cache(examples, "stub", template, options)
-    target = Path(options.cache_dir) / "stub" / f"{examples[0].example_id}.json"
+    target = (
+        Path(options.cache_dir)
+        / "stub"
+        / entry_filename(examples[0].example_id, template_hash(template))
+    )
     target.write_bytes(b"\xff\xfe not json")
 
     stub = stub_teacher_factory()
@@ -183,7 +231,11 @@ def test_wrong_recorded_key_is_a_miss(tmp_path, example_factory, stub_teacher_fa
     template = "Goal: {goal}\nAnswer:"
     options = DistillOptions(cache_dir=tmp_path, teacher=stub_teacher_factory())
     build_soft_label_cache(examples, "stub", template, options)
-    target = Path(options.cache_dir) / "stub" / f"{examples[0].example_id}.json"
+    target = (
+        Path(options.cache_dir)
+        / "stub"
+        / entry_filename(examples[0].example_id, template_hash(template))
+    )
     payload = json.loads(target.read_text("utf-8"))
     payload["template_hash"] = "0" * 64  # valid JSON, wrong key component
     target.write_text(json.dumps(payload), "utf-8")  # hash now mismatches too

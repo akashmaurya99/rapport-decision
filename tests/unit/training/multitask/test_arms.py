@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from src.training.losses import DEFAULT_WEIGHTS
 from src.training.multitask import DEFAULT_TASK_NAMES, build_fixed_weight_config
 from src.training.multitask import arms as arms_module
 
@@ -38,8 +39,10 @@ def test_fixed_arm_consistent_with_a4_yaml():
             continue
         assert config[key] == value, f"key {key!r} drifted from the A4 template"
 
-    # Uniform 1.0 across every canonical task.
-    assert config["weights"] == {task: 1.0 for task in DEFAULT_TASK_NAMES}
+    # The fixed arm carries the §3.2 default weights the Trainer resolves.
+    assert config["weights"] == {
+        task: float(DEFAULT_WEIGHTS[task]) for task in DEFAULT_TASK_NAMES
+    }
     assert set(config["weights"]) == set(DEFAULT_TASK_NAMES)
 
     # The ablation's identifying fields survive.
@@ -53,7 +56,9 @@ def test_fixed_arm_consistent_with_a4_yaml():
 def test_fixed_arm_is_yaml_serializable():
     config = build_fixed_weight_config("A4")
     dumped = yaml.safe_dump(config)
-    assert yaml.safe_load(dumped)["weights"] == {task: 1.0 for task in DEFAULT_TASK_NAMES}
+    assert yaml.safe_load(dumped)["weights"] == {
+        task: float(DEFAULT_WEIGHTS[task]) for task in DEFAULT_TASK_NAMES
+    }
 
 
 def test_fixed_arm_does_not_mutate_template_file():
@@ -85,7 +90,9 @@ def test_fallback_template_used_when_default_missing(monkeypatch, tmp_path):
             continue
         assert config[key] == value
     assert config["weight_mode"] == "fixed"
-    assert config["weights"] == {task: 1.0 for task in DEFAULT_TASK_NAMES}
+    assert config["weights"] == {
+        task: float(DEFAULT_WEIGHTS[task]) for task in DEFAULT_TASK_NAMES
+    }
 
 
 def test_fallback_matches_on_disk_template():

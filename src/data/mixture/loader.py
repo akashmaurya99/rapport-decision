@@ -20,10 +20,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping
+from typing import Any, Mapping
 
 import yaml
 
+from src.data.acquire.manifest import MANIFEST_FILENAME, SourceManifest, load_manifest
 from src.data.core.schema import TASK_FAMILIES
 from src.data.splits.fingerprint import is_sha256_hex
 
@@ -73,11 +74,20 @@ class MixtureDeclaration:
             for family, entries in self.sources.items()
         }
 
-    def sample(self, seed: int, fingerprint: str | None = None) -> MixtureOrder:
+    def sample(
+        self,
+        seed: int,
+        fingerprint: str | None = None,
+        *,
+        available_rows: Any = None,
+        source_status: Any = None,
+    ) -> MixtureOrder:
         """Sample the declaration against ``fingerprint``.
 
         Defaults to the pinned fingerprint; passing a different one (or a
         non-sha256 value) raises a typed error from :func:`sample_mixture`.
+        ``available_rows`` and ``source_status`` are forwarded to
+        :func:`sample_mixture` for real-row binding and quarantine refusal.
         """
         target = self.fingerprint if fingerprint is None else fingerprint
         if not target:
@@ -86,7 +96,14 @@ class MixtureDeclaration:
                 "acquisition-time fingerprint recorded in the split manifest",
                 field="fingerprint",
             )
-        return sample_mixture(self, None, seed, target)
+        return sample_mixture(
+            self,
+            None,
+            seed,
+            target,
+            available_rows=available_rows,
+            source_status=source_status,
+        )
 
 
 def _validate_optional_fingerprint(value: object, *, field_name: str = "fingerprint") -> str:
@@ -188,3 +205,43 @@ def preset_path(name: str) -> Path:
 def load_preset(name: str) -> MixtureDeclaration:
     """Load a packaged preset mixture by name (``starter`` or ``full``)."""
     return load_mixture(preset_path(name))
+
+
+def status_from_manifest(manifest: Any) -> str:
+    """Return the status recorded in a manifest-like object or mapping."""
+    if isinstance(manifest, str):
+        return manifest.strip().lower()
+    if isinstance(manifest, Mapping):
+        status = manifest.get("status")
+    else:
+        status = getattr(manifest, "status", None)
+    return str(status) if status is not None else ""
+
+
+def load_source_statuses(root: str | Path | Mapping[str, Any]) -> dict[str, str]:
+    """Build ``source -> status`` either from a mapping or a manifest directory.
+
+    A mapping is accepted directly (values may be status strings,
+    :class:`~src.data.acquire.SourceManifest` objects or objects with a
+    ``status`` attribute). A directory is scanned for one-level-deep
+    ``source-manifest.json`` files, the layout written by
+    :func:`src.data.acquire.acquire_source`.
+    """
+    if isinstance(root, Mapping):
+        return {str(source): status_from_manifest(value) for source, value in root.items()}
+    directory = Path(root)
+    if not directory.is_dir():
+        from .errors import MixtureConfigError
+
+        raise MixtureConfigError(
+            f"source-status location {directory} is neither a mapping nor a directory"
+        )
+    statuses: dict[str, str] = {}
+    paths = sorted(directory.glob(f"*/{MANIFEST_FILENAME}"))
+    own = directory / MANIFEST_FILENAME
+    if own.is_file():
+        paths.append(own)
+    for path in paths:
+        manifest: SourceManifest = load_manifest(path)
+        statuses[manifest.source] = manifest.status
+    return statuses

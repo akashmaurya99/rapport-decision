@@ -167,6 +167,16 @@ PERMUTATION_SAMPLE_SIZE = 8
 #: declared default utility triple (correct=1, wrong=-3, abstain=0).
 ABSTENTION_THRESHOLD = 0.75
 
+#: All confidence/ECE/abstention figures in this harness are computed from the
+#: model's RAW confidence head. The predictor instead consumes the calibrated
+#: correctness scalar from the frozen CalibrationMap (a distinct value for
+#: Platt buckets). Until a frozen map+policy are injected here, these numbers
+#: are explicitly named diagnostics, NOT predictor-equivalent measurements.
+CONFIDENCE_SEMANTICS = (
+    "raw-confidence-head-diagnostic "
+    "(not the predictor's calibrated correctness / frozen abstention policy)"
+)
+
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 _WORD_TOKEN = re.compile(r"[a-z0-9]+")
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+|[\r\n]+")
@@ -220,6 +230,7 @@ class RobustnessReport:
             "context": self.context,
             "length_sweep": self.length_sweep,
             "notes": list(self.notes),
+            "confidence_semantics": CONFIDENCE_SEMANTICS,
         }
 
 
@@ -252,15 +263,32 @@ class _ScoredRow:
     predicted_index: int
     abstain: bool
     truncated: bool
+    #: False when any score/logit/probability/confidence was non-finite. Such
+    #: rows must make the affected measurement ``not-measured`` — never clamped
+    #: into a seemingly-valid number (a NaN clamped to 0 used to pass Y6).
+    valid: bool = True
 
 
-def _clamp01(value: float) -> float:
-    if value != value:  # NaN guard (sigmoid output cannot be NaN, defensive only)
-        return 0.0
-    return min(1.0, max(0.0, value))
+def _model_device(model: torch.nn.Module) -> torch.device:
+    """Infer the device the model lives on so inputs can be moved to it."""
+    try:
+        for parameter in model.parameters():
+            return parameter.device
+    except Exception:
+        pass
+    try:
+        for buffer in model.buffers():
+            return buffer.device
+    except Exception:
+        pass
+    return torch.device("cpu")
 
 
 def _softmax(logits: Sequence[float]) -> tuple[float, ...]:
+    # A non-finite logit must not be sanitised into a distribution — propagate
+    # NaN so the caller marks the measurement not-measured.
+    if any(not math.isfinite(v) for v in logits):
+        return tuple(float("nan") for _ in logits)
     top = max(logits)
     exps = [math.exp(v - top) for v in logits]
     total = sum(exps)
@@ -274,26 +302,35 @@ def _score_row(
     *,
     budget: int = LENGTH_BUDGETS[0],
 ) -> _ScoredRow:
-    encoded = encode_example(row, budget=budget, tokenizer=tokenizer)
+    encoded = encode_example(row, budget=budget, tokenizer=tokenizer, manifest={})
     n = len(row.options)
-    ids = torch.tensor([list(encoded.input_ids)], dtype=torch.long)
-    attention = torch.tensor([list(encoded.attention_mask)], dtype=torch.long)
-    option_mask = torch.ones((1, n), dtype=torch.long)
-    task_ids = torch.tensor([_TASK_ID[row.task_family]], dtype=torch.long)
+    device = _model_device(model)
+    ids = torch.tensor([list(encoded.input_ids)], dtype=torch.long, device=device)
+    attention = torch.tensor([list(encoded.attention_mask)], dtype=torch.long, device=device)
+    option_mask = torch.ones((1, n), dtype=torch.long, device=device)
+    task_ids = torch.tensor([_TASK_ID[row.task_family]], dtype=torch.long, device=device)
     with torch.no_grad():
         output = model(ids, attention, option_mask, task_ids)
     scores = tuple(float(v) for v in output.scores[0].tolist())
     logits = [float(v) for v in output.choice_logits[0].tolist()]
     probabilities = _softmax(logits)
-    confidence = _clamp01(float(output.confidence.reshape(-1)[0].item()))
+    raw_confidence = float(output.confidence.reshape(-1)[0].item())
+    valid = (
+        all(math.isfinite(v) for v in scores)
+        and all(math.isfinite(v) for v in logits)
+        and all(math.isfinite(v) for v in probabilities)
+        and math.isfinite(raw_confidence)
+    )
+    confidence = raw_confidence if valid else float("nan")
     predicted = max(range(n), key=probabilities.__getitem__)
     return _ScoredRow(
         scores=scores,
         probabilities=probabilities,
         confidence=confidence,
         predicted_index=predicted,
-        abstain=confidence < ABSTENTION_THRESHOLD,
+        abstain=(confidence < ABSTENTION_THRESHOLD) if valid else False,
         truncated=bool(encoded.truncated),
+        valid=valid,
     )
 
 
@@ -335,6 +372,13 @@ def _gold_metrics(
 ) -> dict[str, Any]:
     if not pairs:
         return {"accuracy": None, "bucket_ece": None, "ece_bins": ece_bins}
+    if any(not s.valid for _, s in pairs):
+        # A non-finite score/logit/probability/confidence means this cohort's
+        # metrics are not measured — never clamp NaN into a valid number.
+        return {
+            "accuracy": None, "bucket_ece": None, "ece_bins": ece_bins,
+            "n_invalid": sum(1 for _, s in pairs if not s.valid),
+        }
     gold = [c for c, _ in pairs]
     pred = [s.predicted_index for _, s in pairs]
     confidences = [s.confidence for _, s in pairs]
@@ -343,11 +387,12 @@ def _gold_metrics(
         "accuracy": metrics.accuracy(gold, pred),
         "bucket_ece": metrics.ece(confidences, correct, bins=ece_bins),
         "ece_bins": ece_bins,
+        "n_invalid": 0,
     }
 
 
 def _abstention_rate(scored: Sequence[_ScoredRow]) -> float | None:
-    if not scored:
+    if not scored or any(not s.valid for s in scored):
         return None
     return sum(1 for s in scored if s.abstain) / len(scored)
 
@@ -641,6 +686,7 @@ def _permutation_block(
             accuracies: list[float | None] = []
             payload: list[dict[str, Any]] = []
             deviation = 0.0
+            has_invalid = False
             for perm in permutations:
                 if perm == identity:
                     scored = base
@@ -652,7 +698,10 @@ def _permutation_block(
                         budget=LENGTH_BUDGETS[0],
                         cache=cache,
                     )
-                if chosen_idx:
+                invalid = any(not s.valid for s in base) or any(
+                    not s.valid for s in scored
+                )
+                if chosen_idx and not invalid:
                     correct = 0
                     for i in chosen_idx:
                         chosen = subgroup[i].chosen_index
@@ -663,13 +712,16 @@ def _permutation_block(
                 else:
                     accuracy = None
                 accuracies.append(accuracy)
-                for i in range(len(subgroup)):
-                    slot_scores = scored[i].scores
-                    base_scores = base[i].scores
-                    for j in range(n):
-                        d = abs(slot_scores[j] - base_scores[perm[j]])
-                        if d > deviation:
-                            deviation = d
+                if not invalid:
+                    for i in range(len(subgroup)):
+                        slot_scores = scored[i].scores
+                        base_scores = base[i].scores
+                        for j in range(n):
+                            d = abs(slot_scores[j] - base_scores[perm[j]])
+                            if d > deviation:
+                                deviation = d
+                else:
+                    has_invalid = True
                 payload.append({"permutation": list(perm), "accuracy": accuracy})
             defined = [a for a in accuracies if a is not None]
             delta = (max(defined) - min(defined)) if defined else None
@@ -681,9 +733,9 @@ def _permutation_block(
                 "n_permutations": len(permutations),
                 "permutations": payload,
                 "accuracy_delta": delta,
-                "score_max_deviation": deviation,
+                "score_max_deviation": None if has_invalid else deviation,
                 "score_tolerance": SCORE_TOLERANCE,
-                "within_tolerance": deviation <= SCORE_TOLERANCE,
+                "within_tolerance": None if has_invalid else deviation <= SCORE_TOLERANCE,
             }
         per_family[family] = _permutation_family_entry(rows, by_option_count)
     return {**per_family, "overall": _permutation_overall(per_family)}
@@ -698,7 +750,8 @@ def _permutation_family_entry(
     deviations = [
         e["score_max_deviation"] for e in entries if e["score_max_deviation"] is not None
     ]
-    withins = [e["within_tolerance"] for e in entries if e["within_tolerance"] is not None]
+    all_withins = [e["within_tolerance"] for e in entries]
+    withins = [w for w in all_withins if w is not None]
     return {
         "n_rows": len(rows),
         "n_scored_rows": sum(1 for r in rows if r.chosen_index is not None),
@@ -706,7 +759,9 @@ def _permutation_family_entry(
         "accuracy_delta": max(deltas) if deltas else None,
         "score_max_deviation": max(deviations) if deviations else None,
         "score_tolerance": SCORE_TOLERANCE,
-        "within_tolerance": all(withins) if withins else None,
+        "within_tolerance": (
+            None if any(w is None for w in all_withins) or not withins else all(withins)
+        ),
     }
 
 
@@ -716,7 +771,8 @@ def _permutation_overall(per_family: Mapping[str, Any]) -> dict[str, Any]:
     deviations = [
         e["score_max_deviation"] for e in entries if e["score_max_deviation"] is not None
     ]
-    withins = [e["within_tolerance"] for e in entries if e["within_tolerance"] is not None]
+    all_withins = [e["within_tolerance"] for e in entries]
+    withins = [w for w in all_withins if w is not None]
     return {
         "families": sorted(per_family),
         "n_rows": sum(e["n_rows"] for e in entries),
@@ -724,7 +780,9 @@ def _permutation_overall(per_family: Mapping[str, Any]) -> dict[str, Any]:
         "accuracy_delta": max(deltas) if deltas else None,
         "score_max_deviation": max(deviations) if deviations else None,
         "score_tolerance": SCORE_TOLERANCE,
-        "within_tolerance": all(withins) if withins else None,
+        "within_tolerance": (
+            None if any(w is None for w in all_withins) or not withins else all(withins)
+        ),
     }
 
 
@@ -772,23 +830,33 @@ def _ood_block(
     tokenizer: Any,
     ood_rows: Sequence[DecisionExample],
     train_rows: Sequence[DecisionExample],
+    dev_rows: Sequence[DecisionExample],
     *,
     cache: _ScoreCache,
     fingerprint: str,
     ood_source: str | None,
 ) -> dict[str, Any]:
     train_sources = {r.source for r in train_rows}
-    excluded = [r for r in ood_rows if r.source in train_sources]
-    eligible = [r for r in ood_rows if r.source not in train_sources]
+    dev_sources = {r.source for r in dev_rows}
+    # The withheld source is the one named by the split manifest; it must have
+    # ZERO train and dev rows, otherwise this is not a held-out-source claim.
+    named_source = ood_source if isinstance(ood_source, str) and ood_source.strip() else None
+    n_train_from_source = sum(1 for r in train_rows if r.source == named_source)
+    n_dev_from_source = sum(1 for r in dev_rows if r.source == named_source)
+    excluded = [r for r in ood_rows if r.source != named_source]
+    eligible = [r for r in ood_rows if r.source == named_source]
     base = {
         "ood_source": ood_source,
         "split_manifest_fingerprint": fingerprint,
         "n_excluded": len(excluded),
         "excluded_sources": sorted({r.source for r in excluded}),
         "n_train_sources": len(train_sources),
+        "n_dev_sources": len(dev_sources),
+        "n_train_rows_from_source": n_train_from_source,
+        "n_dev_rows_from_source": n_dev_from_source,
         "ece_bins": metrics.ECE_BINS,
     }
-    if not eligible:
+    if named_source is None or n_train_from_source or n_dev_from_source or not eligible:
         return {
             **base,
             "empty": True,
@@ -799,8 +867,8 @@ def _ood_block(
             "bucket_ece": None,
             "abstention_rate": None,
             "note": (
-                "no OOD rows remain after excluding sources present in train; "
-                "metrics are None rather than fabricated"
+                "no eligible held-out-source rows: the manifest must name a withheld "
+                "source with zero train/dev rows; metrics are None rather than fabricated"
             ),
         }
     by_family: dict[str, Any] = {}
@@ -856,11 +924,10 @@ def _context_stats(
     transform: Callable[[DecisionExample], tuple[DecisionExample, bool] | None],
     cache: _ScoreCache,
 ) -> dict[str, Any]:
-    scored_clean = _score_all(model, tokenizer, rows, budget=LENGTH_BUDGETS[0], cache=cache)
-    clean_pairs = _chosen_pairs(rows, scored_clean)
-    clean_metrics = _gold_metrics(clean_pairs)
-    clean_abstention = _abstention_rate(scored_clean)
-
+    # Transform first, then score the CLEAN rows that actually survived the
+    # transform. Comparing clean metrics over the full set with transformed
+    # metrics over a subset compared two different cohorts (audit finding).
+    kept_clean: list[DecisionExample] = []
     transformed: list[DecisionExample] = []
     skipped_no_gold = 0
     state_emptied = 0
@@ -870,8 +937,13 @@ def _context_stats(
             skipped_no_gold += 1
             continue
         new_row, emptied = result
+        kept_clean.append(row)
         transformed.append(new_row)
         state_emptied += int(emptied)
+    scored_clean = _score_all(model, tokenizer, kept_clean, budget=LENGTH_BUDGETS[0], cache=cache)
+    clean_pairs = _chosen_pairs(kept_clean, scored_clean)
+    clean_metrics = _gold_metrics(clean_pairs)
+    clean_abstention = _abstention_rate(scored_clean)
     scored_t = _score_all(model, tokenizer, transformed, budget=LENGTH_BUDGETS[0], cache=cache)
     t_pairs = _chosen_pairs(transformed, scored_t)
     t_metrics = _gold_metrics(t_pairs)
@@ -891,6 +963,7 @@ def _context_stats(
     )
     return {
         "n_rows": len(rows),
+        "n_compared_rows": len(kept_clean),  # same row IDs on both sides of each delta
         "n_transformed": len(transformed),
         "n_skipped_no_gold": skipped_no_gold,
         "n_state_emptied": state_emptied,
@@ -1012,6 +1085,9 @@ _NOTES: tuple[str, ...] = (
     "from 512 to 1024 sets length_extension to FAIL",
     "families with zero evaluation rows are reported with n_rows=0 and None "
     "metrics, never fabricated",
+    CONFIDENCE_SEMANTICS,
+    "non-finite scores/logits/probabilities/confidence make the affected "
+    "measurement not-measured (never clamped to a valid number)",
 )
 
 
@@ -1044,6 +1120,33 @@ def run_robustness(
     fingerprint, ood_source = _resolve_manifest(split_manifest)
     ood_rows_list = _validate_rows(ood_rows, field="ood_rows")
     families, train_rows, eval_rows = _manifest_rows_by_family(split_rows_by_family)
+    # Echoing a manifest digest is not provenance. Recompute membership from
+    # the actual rows (including the separately supplied OOD block) and refuse
+    # any mismatch before producing measurements.
+    from src.data.splits.fingerprint import membership_fingerprint
+
+    actual_fingerprint = membership_fingerprint(
+        (row.example_id, row.split)
+        for rows in split_rows_by_family.values()
+        for row in rows
+    )
+    ood_fingerprint = membership_fingerprint(
+        (row.example_id, row.split) for row in ood_rows_list
+    )
+    if actual_fingerprint != fingerprint and ood_fingerprint != fingerprint:
+        # The manifest covers the full split; OOD rows may be separated by the
+        # caller, so compare against their union as the canonical case.
+        all_rows = [row for rows in split_rows_by_family.values() for row in rows]
+        all_rows.extend(ood_rows_list)
+        union_fingerprint = membership_fingerprint(
+            (row.example_id, row.split) for row in all_rows
+        )
+        if union_fingerprint != fingerprint:
+            raise RobustnessInputError(
+                "split_manifest fingerprint does not match actual row membership: "
+                f"expected {fingerprint}, computed {union_fingerprint}",
+                field="split_manifest",
+            )
 
     snapshot = dict(TRUNCATION_COUNTS)
     was_training = bool(model.training)
@@ -1054,11 +1157,15 @@ def run_robustness(
         option_count_sweep = _option_count_sweep(
             model, tokenizer, eval_rows, families, bucket_fn, cache
         )
+        dev_rows = [
+            row for rows in eval_rows.values() for row in rows if row.split == "dev"
+        ]
         ood = _ood_block(
             model,
             tokenizer,
             ood_rows_list,
             train_rows,
+            dev_rows,
             cache=cache,
             fingerprint=fingerprint,
             ood_source=ood_source,

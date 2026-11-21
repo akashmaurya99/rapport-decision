@@ -14,6 +14,7 @@ from src.ops import (
 )
 
 _UNSET: object = object()
+_HASH = "c0ffee" * 10 + "c0ff"  # sha256-shaped: 64 lowercase hex chars
 
 
 def make_run(
@@ -34,7 +35,7 @@ def make_run(
     run_dir.mkdir(parents=True)
     if write_manifest:
         rid = name if run_id is _UNSET else run_id
-        ch = "c0ffee" * 4 if config_hash is _UNSET else config_hash
+        ch = _HASH if config_hash is _UNSET else config_hash
         fp = "deadbeef" * 8 if data_fingerprint is _UNSET else data_fingerprint
         payload: dict[str, object] = {}
         if rid is not None:
@@ -73,7 +74,7 @@ def test_valid_run_is_indexed(tmp_path: Path) -> None:
     entry = registry.get("run-a")
     assert entry.manifest_path == root / "run-a" / "manifest.json"
     assert entry.manifest["git_sha"] == "abc123"
-    assert entry.config_hash == "c0ffee" * 4
+    assert entry.config_hash == _HASH
     assert entry.data_fingerprint == "deadbeef" * 8
     assert entry.checkpoint_paths == ()
     assert registry.excluded_count == 0
@@ -105,8 +106,8 @@ def test_run_without_manifest_is_excluded_and_counted(tmp_path: Path) -> None:
     [
         (None, "deadbeef" * 8, "missing_config_hash"),
         ("", "deadbeef" * 8, "invalid_config_hash"),
-        ("c0ffee" * 4, None, "missing_data_fingerprint"),
-        ("c0ffee" * 4, "   ", "invalid_data_fingerprint"),
+        (_HASH, None, "missing_data_fingerprint"),
+        (_HASH, "   ", "invalid_data_fingerprint"),
     ],
 )
 def test_run_missing_fingerprint_or_hash_is_excluded(
@@ -256,6 +257,105 @@ def test_exclusion_does_not_silently_list_anything(tmp_path: Path) -> None:
         assert exclusion.reason == "missing_config_hash"
     with pytest.raises(UnknownRunError):
         registry.get("bad-0")
+
+
+def test_invalid_utf8_manifest_is_excluded_not_fatal(tmp_path: Path) -> None:
+    root = tmp_path / "runs"
+    make_run(root, "good")
+    bad = root / "bad-encoding"
+    bad.mkdir(parents=True)
+    (bad / "manifest.json").write_bytes(b'{"run_id": "\xff\xfe"}')
+
+    registry = RunRegistry(root)
+
+    assert registry.list() == ["good"]
+    assert registry.excluded_count == 1
+    assert registry.exclusions[0].run_dir == bad
+    assert registry.exclusions[0].reason == "invalid_manifest_encoding"
+
+
+def test_directory_run_id_mismatch_is_excluded(tmp_path: Path) -> None:
+    root = tmp_path / "runs"
+    make_run(root, "claims-another-id", run_id="different-id")
+    make_run(root, "good")
+
+    registry = RunRegistry(root)
+
+    assert registry.list() == ["good"]
+    mismatch = [e for e in registry.exclusions if e.reason == "run_id_mismatch"]
+    assert len(mismatch) == 1
+    assert mismatch[0].run_dir == root / "claims-another-id"
+
+
+@pytest.mark.parametrize(
+    ("remove", "reason"),
+    [
+        ("git_sha", "missing_git_sha"),
+        ("seed", "missing_seed"),
+        ("device", "missing_device"),
+        ("versions", "missing_versions"),
+    ],
+)
+def test_missing_contract_fields_are_excluded(tmp_path: Path, remove, reason) -> None:
+    import json as _json
+
+    root = tmp_path / "runs"
+    run_dir = root / "incomplete"
+    make_run(root, "incomplete")
+    path = run_dir / "manifest.json"
+    payload = _json.loads(path.read_text(encoding="utf-8"))
+    del payload[remove]
+    path.write_text(_json.dumps(payload), encoding="utf-8")
+
+    registry = RunRegistry(root)
+    assert registry.list() == []
+    assert registry.exclusions[0].reason == reason
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "reason"),
+    [
+        ("config_hash", "short", "invalid_config_hash"),
+        ("data_fingerprint", 12345, "invalid_data_fingerprint"),
+        ("seed", True, "invalid_seed"),
+        ("seed", -1, "invalid_seed"),
+        ("device", 7, "invalid_device"),
+        ("versions", {}, "invalid_versions"),
+        ("run_id", "../escape", "invalid_run_id"),
+    ],
+)
+def test_wrong_field_types_or_formats_are_excluded(tmp_path: Path, field, value, reason) -> None:
+    import json as _json
+
+    root = tmp_path / "runs"
+    run_dir = root / "wrong-type"
+    make_run(root, "wrong-type")
+    path = run_dir / "manifest.json"
+    payload = _json.loads(path.read_text(encoding="utf-8"))
+    payload[field] = value
+    path.write_text(_json.dumps(payload), encoding="utf-8")
+
+    registry = RunRegistry(root)
+    assert registry.list() == []
+    assert registry.exclusions[0].reason == reason
+
+
+def test_unreadable_manifest_does_not_abort_scan(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "runs"
+    make_run(root, "good")
+    make_run(root, "unreadable")
+
+    original = Path.read_bytes
+
+    def flaky_read(self: Path) -> bytes:
+        if self.name == "manifest.json" and self.parent.name == "unreadable":
+            raise OSError("permission denied")
+        return original(self)
+
+    monkeypatch.setattr(Path, "read_bytes", flaky_read)
+    registry = RunRegistry(root)
+    assert registry.list() == ["good"]
+    assert [e.reason for e in registry.exclusions] == ["unreadable_manifest"]
 
 
 def test_entry_to_dict_is_json_serializable(tmp_path: Path) -> None:

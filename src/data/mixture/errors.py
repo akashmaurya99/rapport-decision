@@ -38,6 +38,42 @@ class MixtureSourceError(MixtureInputError):
     code = "MIXTURE_BAD_SOURCE"
 
 
+class MixtureQuarantinedSourceError(MixtureSourceError):
+    """A declarative source is marked ``quarantine`` in its acquisition manifest.
+
+    TASK-07 acceptance: a quarantined source may never enter a training
+    mixture. The mixture refuses the whole declaration rather than silently
+    dropping the source and training on a different distribution.
+    """
+
+    code = "MIXTURE_SOURCE_QUARANTINED"
+
+    def __init__(self, message: str, *, source: str, status: str) -> None:
+        super().__init__(message, field="source")
+        self.source = source
+        self.status = status
+
+
+class MixtureAvailabilityError(MixtureSourceError):
+    """Available rows cannot satisfy a declared (family, source) allocation.
+
+    Either the source has no rows for that family, or fewer rows than the
+    declaration requests. Both are fatal: sampling a different corpus than
+    the one declared breaks reproducibility.
+    """
+
+    code = "MIXTURE_ROWS_UNAVAILABLE"
+
+    def __init__(
+        self, message: str, *, family: str, source: str, requested: int, available: int
+    ) -> None:
+        super().__init__(message, field="source")
+        self.family = family
+        self.source = source
+        self.requested = requested
+        self.available = available
+
+
 class MixtureFingerprintError(MixtureError):
     """The fingerprint is absent, or not a lowercase sha256 hex digest."""
 

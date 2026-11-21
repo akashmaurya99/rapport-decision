@@ -93,6 +93,12 @@ class SourceManifest:
     shard_bytes: dict[str, int] = field(default_factory=dict)
     quarantine_reason: str | None = None
     license_origin: str | None = None
+    # Adapter/layout provenance prevents accidental raw<->unified reuse.
+    adapter: str | None = None
+    shard_layout: str = "raw"
+    raw_input_rows: int | None = None
+    rejected_rows: int = 0
+    adapter_report: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not isinstance(self.source, str) or not self.source.strip():
@@ -137,6 +143,24 @@ class SourceManifest:
                 f"status must be one of {sorted(_VALID_STATUSES)}, got {self.status!r}",
                 field="status",
             )
+        if self.shard_layout not in {"raw", "decision-example"}:
+            raise ManifestInvalidError(
+                f"unknown shard layout {self.shard_layout!r}", field="shard_layout"
+            )
+        if self.adapter is not None and (
+            not isinstance(self.adapter, str) or not self.adapter.strip()
+        ):
+            raise ManifestInvalidError(
+                "adapter must be a non-empty string or null", field="adapter"
+            )
+        if self.raw_input_rows is not None and (
+            type(self.raw_input_rows) is not int or self.raw_input_rows < 0
+        ):
+            raise ManifestInvalidError("raw_input_rows must be a non-negative integer or null")
+        if type(self.rejected_rows) is not int or self.rejected_rows < 0:
+            raise ManifestInvalidError("rejected_rows must be a non-negative integer")
+        if not isinstance(self.adapter_report, dict):
+            raise ManifestInvalidError("adapter_report must be an object")
         object.__setattr__(self, "shards", [Path(p) for p in self.shards])
         for name, digest in self.shard_sha256.items():
             if not _SHA256_RE.fullmatch(digest):
@@ -197,6 +221,11 @@ class SourceManifest:
             "shard_bytes": dict(self.shard_bytes),
             "quarantine_reason": self.quarantine_reason,
             "license_origin": self.license_origin,
+            "adapter": self.adapter,
+            "shard_layout": self.shard_layout,
+            "raw_input_rows": self.raw_input_rows,
+            "rejected_rows": self.rejected_rows,
+            "adapter_report": self.adapter_report,
         }
 
     def to_json(self) -> str:
@@ -223,6 +252,11 @@ class SourceManifest:
             "shard_bytes",
             "quarantine_reason",
             "license_origin",
+            "adapter",
+            "shard_layout",
+            "raw_input_rows",
+            "rejected_rows",
+            "adapter_report",
         }
         if unknown:
             raise ManifestInvalidError(f"manifest contains unknown keys: {sorted(unknown)}")
@@ -259,6 +293,11 @@ class SourceManifest:
             shard_bytes={str(k): v for k, v in shard_bytes.items()},
             quarantine_reason=data.get("quarantine_reason"),
             license_origin=data.get("license_origin"),
+            adapter=data.get("adapter"),
+            shard_layout=data.get("shard_layout", "raw"),
+            raw_input_rows=data.get("raw_input_rows"),
+            rejected_rows=data.get("rejected_rows", 0),
+            adapter_report=data.get("adapter_report") or {},
         )
 
     @classmethod

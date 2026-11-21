@@ -98,7 +98,9 @@ class TestAblationArms:
 
     def test_a1_init_alternates(self):
         config = load("a1-init.yaml")
-        assert config["init"] == "bge-small"
+        # The shipped arm trains from scratch: this architecture has no
+        # pretrained-trunk loader. The declared alternates stay recorded.
+        assert config["init"] == "scratch"
         alternates = {variant["init"] for variant in config["variants"]}
         assert alternates == {"bge-small", "random", "all-MiniLM-L6-v2"}
 
@@ -155,7 +157,7 @@ class TestStarterAndAcceptance:
         assert config["mixture"] == "starter"
         assert config["mixture_rows"] == 55_000
         assert config["variant"] == "compact"
-        assert config["init"] == "bge-small"
+        assert config["init"] == "scratch"
 
     def test_acceptance_is_the_115_6k_run(self):
         config = load("acceptance.yaml")
@@ -163,7 +165,7 @@ class TestStarterAndAcceptance:
         assert config["mixture"] == "full"
         assert config["mixture_rows"] == 115_600
         assert config["variant"] == "compact"
-        assert config["init"] == "bge-small"
+        assert config["init"] == "scratch"
 
     def test_acceptance_records_the_withheld_ood_source(self):
         config = load("acceptance.yaml")

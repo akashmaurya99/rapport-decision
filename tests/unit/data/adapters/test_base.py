@@ -33,6 +33,15 @@ def test_rejected_record_shape():
     assert (index, code) == (3, "ADAPTOR_NO_GOLD")
 
 
+def test_fingerprint_row_accepts_non_string_mapping_keys():
+    mixed = {"a": 1, 2: "two", "nested": {3: "three"}}
+    fingerprint = fingerprint_row(mixed)
+    assert isinstance(fingerprint, str) and len(fingerprint) == 64
+    assert fingerprint == fingerprint_row(mixed)
+    # Coercion is stable regardless of dict insertion order.
+    assert fingerprint == fingerprint_row({2: "two", "nested": {3: "three"}, "a": 1})
+
+
 def test_shuffle_is_deterministic_per_row_content():
     fp = fingerprint_row({"a": 1})
     order_a, seed_a = shuffle_order(8, master_seed=13, row_fingerprint=fp)

@@ -115,18 +115,36 @@ def apply_platt(confidence: float, a: float, b: float) -> float:
 def apply_platt_to_distribution(
     probs: Sequence[float], a: float, b: float
 ) -> tuple[list[float], float]:
-    """Platt-scale a full option distribution.
+    """Calibrate the *correctness* of a decision without changing its choice.
 
-    The argmax slot carries the Platt-calibrated correctness probability
-    ``cal = sigmoid(a·logit(conf) + b)``; the remaining slots keep their raw
-    relative proportions and share the residual mass ``1 − cal``. Sums to 1.
-    Returns ``(probabilities, calibrated_confidence)``.
+    Platt scaling estimates ``P(top-1 option is correct)`` — a scalar about the
+    raw argmax option, **not** a categorical re-distribution over the options.
+    Embedding that scalar into the argmax probability slot (an earlier design)
+    could flip the decision: with ``(a, b) = (0, -3)`` and raw logits ``[4, 0]``
+    the calibrated correctness is ``sigmoid(-3) ≈ 0.047``, which made the
+    *second* option the argmax of the returned distribution. That is wrong: the
+    choice must always follow the raw choice-logit argmax.
+
+    This function therefore returns:
+
+    * ``probabilities`` — the (normalised) raw option distribution, untouched by
+      Platt scaling. Its argmax is exactly the raw argmax, so a caller that
+      picks ``argmax(probabilities)`` picks the same option the model chose.
+    * ``calibrated_confidence`` — the Platt-calibrated correctness probability
+      ``sigmoid(a·logit(conf) + b)`` where ``conf = max(probabilities)``. This is
+      a distinct scalar with *correctness* semantics; in particular it is not
+      ``max(probabilities)`` when Platt scaling is active. Consumers (e.g. the
+      abstention policy) must use this scalar, never the categorical maximum.
+
+    The two returned values obey ``0 <= calibrated_confidence <= 1`` and
+    ``sum(probabilities) == 1``; no inequality between them is asserted because
+    none holds in general (correctness can be lower than ``max(probabilities)``).
     """
     p = [float(v) for v in probs]
     if not p:
         raise CalibrationInputError("probs must be non-empty")
-    if any(v < 0.0 or v > 1.0 for v in p):
-        raise CalibrationInputError("probs must all be in [0, 1]")
+    if any(not math.isfinite(v) or v < 0.0 or v > 1.0 for v in p):
+        raise CalibrationInputError("probs must all be finite and in [0, 1]")
     total = sum(p)
     if not math.isfinite(total) or total <= 0.0:
         raise CalibrationInputError("probs must sum to a positive finite value")
@@ -134,20 +152,5 @@ def apply_platt_to_distribution(
     argmax = max(range(len(p)), key=lambda i: p[i])
     conf = p[argmax]
     cal = apply_platt(conf, a, b)
-    if conf >= 1.0 - 1e-9:
-        # No mass left in the other slots; spread the residual uniformly.
-        out = [0.0] * len(p)
-        out[argmax] = cal
-        residual = 1.0 - cal
-        others = [i for i in range(len(p)) if i != argmax]
-        if others:
-            share = residual / len(others)
-            for i in others:
-                out[i] = share
-        return out, cal
-    residual = 1.0 - cal
-    other_mass = 1.0 - conf
-    factor = residual / other_mass
-    out = [v * factor for v in p]
-    out[argmax] = cal
-    return out, cal
+    # Keep the option distribution intact — Platt only recalibrates correctness.
+    return p, cal

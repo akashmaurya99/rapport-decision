@@ -58,9 +58,15 @@ class RapportConfig:
     vocab_size: int
     embedding_dim: int  # factorized bottleneck for U; == d_model for C/L
     spec: SpecConstants
-    max_seq_len: int = 512
     rope_base: float = 10_000.0
     rms_eps: float = 1e-6
+    # Backward-compatible default: 0.0 keeps every existing behaviour bitwise
+    # identical. Positive values are wired into SDPA and the block residuals.
+    dropout: float = 0.0
+
+    def __post_init__(self) -> None:
+        if not 0.0 <= self.dropout < 1.0:
+            raise ValueError(f"dropout must lie in [0, 1), got {self.dropout!r}")
 
     @classmethod
     def ultra(cls) -> "RapportConfig":
@@ -99,8 +105,10 @@ class RapportConfig:
             norms_total=3_840,
             trunk=7_622_400,
             embedding=3_947_776,
-            heads_total=343_000,
-            total=11_913_176,
+            # Reconciled against RapportModel(count_parameters): the spec
+            # headline understated the heads by 30,986 (+8 log_tau included).
+            heads_total=373_986,
+            total=11_944_162,
             rows=rows,
         )
         return cls("RAPPORT-U", 6, 320, 5, 64, 896, 30_522, 128, spec)
@@ -183,8 +191,10 @@ class RapportConfig:
             norms_total=14_336,
             trunk=38_492_160,
             embedding=13_673_856,
-            heads_total=666_000,
-            total=52_832_016,
+            # Reconciled against RapportModel(count_parameters): the spec
+            # headline overstated the heads by 28,846 (+8 log_tau included).
+            heads_total=637_154,
+            total=52_803_170,
             rows=rows,
         )
         return cls("RAPPORT-L", 16, 448, 7, 64, 1192, 30_522, 448, spec)

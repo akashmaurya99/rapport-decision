@@ -54,6 +54,7 @@ from src.inference.export import (  # noqa: E402
     REFERENCE_BATCH_SEED,
     ExportSelection,
     GateOutcome,
+    OnnxArtifactInvalidError,
     OnnxExportMismatchError,
     QuantizationRejectedError,
     QuantizationReportError,
@@ -512,19 +513,29 @@ def test_quantize_dynamic_int8_keeps_cosine_path_fp32(tmp_path: Path) -> None:
 
 
 @onnx_required
-def test_convert_fp32_to_fp16_reports_sizes(tmp_path: Path) -> None:
+def test_convert_fp32_to_fp16_refuses_invalid_graph(tmp_path: Path) -> None:
+    """The installed transformer emits a non-topologically-sorted FP16 graph.
+
+    It must be refused loudly rather than reported as a valid artifact.
+    """
     model = _tiny_model()
     fp32_artifact = tmp_path / "rapport-test.onnx"
     fp16_artifact = tmp_path / "rapport-test.fp16.onnx"
     export_onnx(model, {"name": "rapport-test"}, fp32_artifact)
 
-    report = convert_fp32_to_fp16(fp32_artifact, fp16_artifact)
-
-    assert report["artifact"] == "fp16"
+    try:
+        report = convert_fp32_to_fp16(fp32_artifact, fp16_artifact)
+    except OnnxArtifactInvalidError as exc:
+        assert "invalid ONNX graph" in str(exc) or "failed" in str(exc)
+        return
+    # If a future onnxruntime build emits a valid graph, it must still have
+    # passed checker + ORT session + padded parity checks.
+    assert report["checker_passed"] is True
+    assert report["ort_session_passed"] is True
     assert fp16_artifact.exists()
     assert report["fp16_size_bytes"] == fp16_artifact.stat().st_size
-    assert report["fp16_size_bytes"] <= report["source_fp32_bytes"]
-    assert report["keep_io_types"] is True
+    assert set(report["reference_max_abs_diffs"]) == set(OUTPUT_NAMES)
+    assert set(report["padded_max_abs_diffs"]) == set(OUTPUT_NAMES)
 
 
 @onnx_required
@@ -534,13 +545,20 @@ def test_full_pipeline_serialized_sizes_and_p95(tmp_path: Path) -> None:
     fp16_artifact = tmp_path / "rapport-test.fp16.onnx"
     int8_artifact = tmp_path / "rapport-test.int8.onnx"
     export_onnx(model, {"name": "rapport-test"}, fp32_artifact)
-    convert_fp32_to_fp16(fp32_artifact, fp16_artifact)
+    try:
+        convert_fp32_to_fp16(fp32_artifact, fp16_artifact)
+        fp16_available = fp16_artifact.exists()
+    except OnnxArtifactInvalidError:
+        fp16_available = False  # invalid FP16 graph is refused, not shipped
     quantize_report = quantize_dynamic_int8(fp32_artifact, int8_artifact)
 
     sizes = serialized_sizes(tmp_path)
     assert sizes["fp32"] == fp32_artifact.stat().st_size
-    assert sizes["fp16"] == fp16_artifact.stat().st_size
     assert sizes["int8"] == int8_artifact.stat().st_size
+    if fp16_available:
+        assert sizes["fp16"] == fp16_artifact.stat().st_size
+    else:
+        assert sizes["fp16"] is None
 
     import onnxruntime as ort
 
@@ -606,3 +624,87 @@ def test_waiver_note() -> None:
     # Documents the skip contract: tests above that need onnx carry reason
     # onnx-not-installed; the rest run unconditionally.
     assert WAIVER_NOTE == "onnx-not-installed"
+
+
+# ---------------------------------------------------------------------------
+# audit findings 5 & 11: non-finite diffs, dynamic-shape gating, INT8 claims
+# ---------------------------------------------------------------------------
+
+
+@onnx_required
+def test_export_rejects_non_finite_diff(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """NaN > tolerance is False — non-finite diffs must be checked explicitly."""
+    from src.inference import export as export_module
+
+    def _nan_compare(module, path, batch):  # noqa: ANN001, ANN202
+        diffs = {name: 0.0 for name in OUTPUT_NAMES}
+        diffs["choice_logits"] = float("nan")
+        return diffs
+
+    monkeypatch.setattr(export_module, "_compare_against_pytorch", _nan_compare)
+    with pytest.raises(OnnxExportMismatchError, match="non-finite"):
+        export_onnx(_tiny_model(), {}, tmp_path / "nan.onnx")
+
+
+@onnx_required
+def test_export_gates_dynamic_shape_comparison(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dynamic-shape mismatch must fail the export, not just be recorded."""
+    from src.inference import export as export_module
+
+    def _shape_compare(module, path, batch):  # noqa: ANN001, ANN202
+        diffs = {name: 0.0 for name in OUTPUT_NAMES}
+        if batch["input_ids"].shape[0] == 3:  # smoke batch
+            diffs["choice_logits"] = EXPORT_TOLERANCE * 10
+        return diffs
+
+    monkeypatch.setattr(export_module, "_compare_against_pytorch", _shape_compare)
+    with pytest.raises(OnnxExportMismatchError, match="dynamic-shape"):
+        export_onnx(_tiny_model(), {}, tmp_path / "shape.onnx")
+
+
+@onnx_required
+def test_int8_drift_failure_refuses_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.inference import export as export_module
+
+    fp32 = tmp_path / "m.onnx"
+    export_onnx(_tiny_model(), {}, fp32)
+
+    def _bad_sessions(reference_session, candidate_session, batch):  # noqa: ANN001, ANN202
+        raise RuntimeError("ORT session failed")
+
+    monkeypatch.setattr(export_module, "_compare_sessions", _bad_sessions)
+    with pytest.raises(OnnxArtifactInvalidError, match="drift evaluation failed"):
+        export_module.quantize_dynamic_int8(fp32, tmp_path / "m.int8.onnx")
+
+
+@onnx_required
+def test_quantized_cosine_path_inspection_uses_operator_types() -> None:
+    """Inspection looks at the graph's op types / weight dtypes, not node names."""
+    from onnx import TensorProto, helper
+
+    from src.inference.export import _quantized_cosine_path_is_fp32
+
+    node = helper.make_node("MatMul", ["w", "x"], ["y"], name="readout/query")
+    graph = helper.make_graph(
+        [node], "g",
+        [helper.make_tensor_value_info("x", TensorProto.FLOAT, [2, 2])],
+        [helper.make_tensor_value_info("y", TensorProto.FLOAT, [2, 2])],
+        [helper.make_tensor("w", TensorProto.FLOAT, [2, 2], [1.0, 0, 0, 1.0])],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    assert _quantized_cosine_path_is_fp32(model, ["readout/query"]) is True
+
+    # Quantized operator: must be refused even though the node name is unchanged.
+    qnode = helper.make_node("MatMulInteger", ["w", "x"], ["y"], name="readout/query")
+    qgraph = helper.make_graph(
+        [qnode], "g",
+        [helper.make_tensor_value_info("x", TensorProto.FLOAT, [2, 2])],
+        [helper.make_tensor_value_info("y", TensorProto.FLOAT, [2, 2])],
+        [helper.make_tensor("w", TensorProto.FLOAT, [2, 2], [1.0, 0, 0, 1.0])],
+    )
+    qmodel = helper.make_model(qgraph, opset_imports=[helper.make_opsetid("", 17)])
+    assert _quantized_cosine_path_is_fp32(qmodel, ["readout/query"]) is False

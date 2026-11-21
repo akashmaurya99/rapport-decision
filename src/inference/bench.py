@@ -29,12 +29,17 @@ Design (the contract left the following open; all decisions are recorded here)
   torch path on CUDA, where ``torch.cuda.Event`` with an explicit
   ``torch.cuda.synchronize`` is used (documented in ``precision_note`` and
   ``latency_method``). The ONNX Runtime path always uses ``perf_counter``.
-* **p95 reuse.** p50/p99 use the nearest-rank rule on one shared timed pass
-  per (precision, batch); p95 is produced by :func:`benchmark_p95` from
-  ``src.inference.export`` (TASK-23, nearest-rank, same formula), which runs
-  its own warmup + timed pass. Throughput (decisions/s) is derived from the
-  shared timed pass. Consequently two timed passes run per (precision, batch);
-  they measure the same distribution and agree within noise.
+* **One synchronized latency array.** p50/p95/p99 all use the nearest-rank
+  rule on ONE synchronized timed array per (precision, batch) — CUDA events
+  with an explicit ``torch.cuda.synchronize`` for torch on CUDA, perf_counter
+  elsewhere. Throughput is derived from the same pass. A separate unsynchronized
+  p95 pass (previously reused from ``export.benchmark_p95``) is deliberately
+  removed: mixing timing methods made p95 disagree with its neighbours.
+* **INT8 gate baseline.** The 2× speedup condition compares the INT8 ONNX
+  Runtime session against an FP32 ONNX Runtime CPU session under the identical
+  input/timing protocol — never against the torch FP32 path (a different
+  runtime and kernel stack). When no FP32 ONNX artifact is available the gate
+  baseline is ``None`` (not evaluated), never silently substituted.
 * **CPU degradation (documented in ``precision_note``).** No CUDA-specific
   measurement is faked:
 
@@ -114,7 +119,6 @@ from torch import nn
 from src.inference.export import (
     REFERENCE_SEQ_LEN,
     QuantizationReportError,
-    benchmark_p95,
     make_reference_batch,
     quantization_gate,
     serialized_sizes,
@@ -297,8 +301,8 @@ class _TorchSession:
     """ORT-like adapter (``run(None, feed)``) so a torch model can be timed.
 
     ONNX Runtime accepts a numpy feed; the torch model needs tensors, so this
-    adapter converts back. It enables :func:`benchmark_p95` (and the shared
-    timed pass) to run unmodified on either backend.
+    adapter converts back. It lets the shared timed pass run unmodified on
+    either backend.
     """
 
     def __init__(self, model: nn.Module, device: torch.device) -> None:
@@ -422,11 +426,14 @@ def _measure(
     latencies, total_seconds = _time_session(
         session, feed, warmup=warmup, iters=iters, use_cuda_events=use_cuda_events
     )
+    # p50/p95/p99 come from ONE synchronized latency array (the CUDA path uses
+    # cuda events + explicit synchronize; the CPU path uses perf_counter). A
+    # second, unsynchronized p95 pass mixed methods and could disagree with its
+    # neighbours — that is deliberately removed.
     p50 = _nearest_rank(latencies, 0.50)
+    p95 = _nearest_rank(latencies, 0.95)
     p99 = _nearest_rank(latencies, 0.99)
-    # Reused from src.inference.export (TASK-23): nearest-rank p95.
-    p95 = float(benchmark_p95(session, batch, iters=iters, warmup=warmup))
-    throughput = float(rows * iters / total_seconds) if total_seconds > 0 else 0.0
+    throughput = float(rows * iters / total_seconds) if total_seconds > 0 else None
     return {
         "p50_ms": p50,
         "p95_ms": p95,
@@ -469,7 +476,7 @@ class BenchReport:
     p50_ms: dict[str, float | None]
     p95_ms: dict[str, float | None]
     p99_ms: dict[str, float | None]
-    throughput_decisions_per_s: float
+    throughput_decisions_per_s: float | None
     peak_rss_mb: float
     peak_vram_mb: float | None
     environment: dict[str, Any]
@@ -590,7 +597,7 @@ def run_benchmark(
     # -- artifact resolution (sizes + INT8 session) -------------------------
     temp_dir: Path | None = None
     try:
-        sizes, int8_path, sizes_note, temp_dir = _resolve_artifacts(
+        sizes, int8_path, sizes_note, temp_dir, fp32_ort_path = _resolve_artifacts(
             model, tokenizer, artifacts_dir, int8_artifact
         )
     # pragma: no cover - defensive; _resolve_artifacts handles its own errors
@@ -599,12 +606,24 @@ def run_benchmark(
         int8_path = None
         sizes_note = f"artifact resolution failed unexpectedly ({type(exc).__name__}: {exc})"
         temp_dir = None
+        fp32_ort_path = None
 
     int8_session: Any = None
     if int8_path is not None:
         int8_session, int8_error = _load_ort_session(int8_path)
         if int8_error is not None:
             sizes_note = f"{sizes_note}; INT8 session failed to load ({int8_error})"
+
+    # FP32 ORT CPU session: the INT8 speedup gate must compare INT8 against an
+    # FP32 ONNX Runtime baseline under an IDENTICAL input/timing protocol —
+    # not against the torch FP32 path (different runtime and kernel stack).
+    fp32_ort_session: Any = None
+    if fp32_ort_path is not None:
+        fp32_ort_session, fp32_ort_error = _load_ort_session(fp32_ort_path)
+        if fp32_ort_error is not None:
+            sizes_note = (
+                f"{sizes_note}; FP32-ORT baseline failed to load ({fp32_ort_error})"
+            )
 
     notes: list[str] = []
     notes.append(
@@ -680,6 +699,14 @@ def run_benchmark(
                     device_type=device_type if token != "int8" else "cpu",
                 )
             measurements[token] = per_batch
+        # Time the FP32-ORT baseline with the SAME protocol as INT8 (CPU,
+        # perf_counter, identical warmup/iters/batch).
+        if fp32_ort_session is not None and 1 in normalized_batches:
+            fp32_ort_measure = _measure(
+                fp32_ort_session, batches[1], rows=1,
+                warmup=warmup, iters=iters, device_type="cpu",
+            )
+            measurements.setdefault("fp32_ort", {})["1"] = fp32_ort_measure
     finally:
         if temp_dir is not None:
             shutil.rmtree(temp_dir, ignore_errors=True)
@@ -699,16 +726,17 @@ def run_benchmark(
     )
 
     latency_method = (
-        "perf_counter (onnxruntime) / cuda-events (torch on CUDA); warmup discarded; "
-        "two timed passes per (precision, batch): shared pass for p50/p99/throughput, "
-        "export.benchmark_p95 for p95"
+        "single synchronized latency array per (precision, batch): cuda-events with "
+        "explicit synchronize for torch on CUDA, perf_counter elsewhere; warmup "
+        "discarded; p50/p95/p99/throughput all derived from that same array"
     )
 
     notes.append(sizes_note)
     notes.append(
-        "latency: time.perf_counter everywhere except the torch path on CUDA, which uses "
-        "torch.cuda.Event with torch.cuda.synchronize; the ONNX Runtime path always uses "
-        "perf_counter. Warmup iterations are discarded."
+        "latency: one synchronized array per (precision,batch) — CUDA events with "
+        "synchronize on CUDA, perf_counter elsewhere; p50/p95/p99 from that same array. "
+        "The INT8 speedup gate uses the FP32 ONNX Runtime session as baseline under "
+        "the identical protocol, never the torch FP32 path."
     )
     notes.append(
         "RSS: max of psutil current RSS and resource.getrusage(RUSAGE_SELF).ru_maxrss "
@@ -720,7 +748,9 @@ def run_benchmark(
         f"seq_len={resolved_seq_len}; the batch never leaves the process."
     )
 
-    fp32_p95 = measurements.get("fp32", {}).get("1", {}).get("p95_ms")
+    # Gate baseline: FP32 ONNX Runtime (same runtime as INT8), falling back to
+    # None — never to the torch FP32 p95 — when no FP32 ONNX artifact exists.
+    fp32_p95 = measurements.get("fp32_ort", {}).get("1", {}).get("p95_ms")
     int8_p95 = measurements.get("int8", {}).get("1", {}).get("p95_ms")
     gate_outcome = _evaluate_gate(gate_report, fp32_p95, int8_p95, sizes.get("int8"))
 
@@ -731,7 +761,7 @@ def run_benchmark(
         p50_ms=_metric("p50_ms"),
         p95_ms=_metric("p95_ms"),
         p99_ms=_metric("p99_ms"),
-        throughput_decisions_per_s=float(throughput) if throughput else 0.0,
+        throughput_decisions_per_s=throughput,  # None for a skipped precision
         peak_rss_mb=_peak_rss_mb(),
         peak_vram_mb=_peak_vram_mb(device),
         environment=environment_block(),
@@ -764,8 +794,8 @@ def _resolve_artifacts(
     tokenizer: Any,
     artifacts_dir: str | Path | None,
     int8_artifact: str | Path | None,
-) -> tuple[dict[str, int | None], Path | None, str, Path | None]:
-    """Return (sizes, int8_path, note, temp_dir).
+) -> tuple[dict[str, int | None], Path | None, str, Path | None, Path | None]:
+    """Return (sizes, int8_path, note, temp_dir, fp32_ort_path).
 
     Resolution order: explicit ``int8_artifact`` → artifacts directory (kwarg,
     ``RAPPORT_ARTIFACTS_DIR`` or ``./artifacts``) → temporary export. When a
@@ -779,11 +809,17 @@ def _resolve_artifacts(
     if directory is not None:
         sizes = serialized_sizes(directory)
         int8_path = explicit_int8 or _first_int8_onnx(directory)
+        from src.inference.export import _classify_variant
+
+        fp32_candidates = sorted(
+            p for p in directory.glob("*.onnx") if _classify_variant(p.name) == "fp32"
+        )
+        fp32_path = fp32_candidates[0] if fp32_candidates else None
         note = (
             f"serialized sizes read from artifacts directory {directory}; "
             f"INT8 artifact {'at ' + str(int8_path) if int8_path else 'not found'}"
         )
-        return dict(sizes), int8_path, note, None
+        return dict(sizes), int8_path, note, None, fp32_path
 
     # Temporary-export fallback: keeps FR-INFER-03 (sizes for all three
     # variants) satisfiable on hosts without pre-existing artifacts. Only the
@@ -794,7 +830,7 @@ def _resolve_artifacts(
             explicit_int8,
             "no artifacts directory found and the model is not a RapportModel; "
             "temporary export is only defined for RapportModel — serialized sizes unavailable",
-            None,
+            None, None,
         )
     try:
         temp_dir = Path(tempfile.mkdtemp(prefix="rapport-bench-"))
@@ -804,25 +840,34 @@ def _resolve_artifacts(
             explicit_int8,
             f"no artifacts directory found and a temporary directory could not be created "
             f"({exc}); serialized sizes are unavailable",
-            None,
+            None, None,
         )
+    notes: list[str] = []
     try:
         from src.inference import export as export_module
 
         spec = _tokenizer_spec(tokenizer, model)
         fp32_path = temp_dir / "rapport-fp32.onnx"
         export_module.export_onnx(model, spec, fp32_path)
+        # FP16 conversion may refuse an invalid graph; INT8 timing and the
+        # FP32-ORT gate baseline do not depend on it, so keep going and report
+        # fp16 size as None in that case.
         fp16_path = temp_dir / "rapport-fp16.onnx"
-        export_module.convert_fp32_to_fp16(fp32_path, fp16_path)
+        try:
+            export_module.convert_fp32_to_fp16(fp32_path, fp16_path)
+        except Exception as exc:  # pragma: no cover - depends on onnxruntime build
+            notes.append(f"FP16 conversion refused ({type(exc).__name__}: {exc})")
         int8_path = temp_dir / "rapport-int8.onnx"
         export_module.quantize_dynamic_int8(fp32_path, int8_path)
         sizes = dict(serialized_sizes(temp_dir))
         note = (
-            f"no artifacts directory found; FP32/FP16/INT8 artifacts were temporarily "
+            f"no artifacts directory found; FP32 and INT8 artifacts were temporarily "
             f"exported to {temp_dir} to measure serialized sizes and time INT8 "
             f"(removed after the run)"
         )
-        return sizes, explicit_int8 or int8_path, note, temp_dir
+        if notes:
+            note += "; " + " ".join(notes)
+        return sizes, explicit_int8 or int8_path, note, temp_dir, fp32_path
     except Exception as exc:
         shutil.rmtree(temp_dir, ignore_errors=True)
         return (
@@ -831,7 +876,7 @@ def _resolve_artifacts(
             f"no artifacts directory found and the temporary export failed "
             f"({type(exc).__name__}: {exc}); serialized sizes and temporary INT8 timings "
             f"are unavailable",
-            None,
+            None, None,
         )
 
 
@@ -852,8 +897,21 @@ def _evaluate_gate(
     int8_size_bytes: int | None,
 ) -> dict[str, Any]:
     if gate_report is not None:
+        if fp32_p95_ms is None or int8_p95_ms is None:
+            return {
+                "status": "not_evaluated",
+                "reason": "synchronized FP32-ORT and INT8 latency measurements are required",
+            }
+        # Caller evidence supplies accuracy/ECE/cosine fields only. Latency and
+        # size are always overridden by THIS run's synchronized measurements;
+        # a stale caller report can never bypass the measured baseline.
+        measured_report = dict(gate_report)
+        measured_report["fp32_p95_ms"] = float(fp32_p95_ms)
+        measured_report["int8_p95_ms"] = float(int8_p95_ms)
+        if int8_size_bytes is not None:
+            measured_report["int8_size_bytes"] = int(int8_size_bytes)
         try:
-            outcome = quantization_gate(gate_report)
+            outcome = quantization_gate(measured_report)
         except QuantizationReportError as exc:
             return {"status": "error", "error": str(exc)}
         except Exception as exc:

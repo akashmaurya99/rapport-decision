@@ -295,7 +295,9 @@ def _preference_loss(
     if not bool(valid.any()):
         return _zero_like(reference), False
     ex, w, lo = example[valid], winner[valid], loser[valid]
-    diff = output.choice_logits[ex, w] - output.choice_logits[ex, lo]
+    # Compute in FP32 even under autocast: logits arrive in fp16 from the
+    # autocast graph, and every other term explicitly upcasts to FP32.
+    diff = output.choice_logits[ex, w].float() - output.choice_logits[ex, lo].float()
     return F.binary_cross_entropy_with_logits(diff, torch.ones_like(diff)), True
 
 
@@ -322,7 +324,8 @@ def _score_loss(
     valid = mask & rows.unsqueeze(1)
     if not bool(valid.any()):
         return _zero_like(reference), False
-    diff = output.scores[valid] - targets[valid]
+    # Huber in FP32 (scores may be fp16 under autocast; targets are fp32).
+    diff = output.scores[valid].float() - targets[valid].float()
     return F.huber_loss(diff, torch.zeros_like(diff), delta=_HUBER_DELTA), True
 
 

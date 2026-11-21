@@ -13,12 +13,15 @@ import pytest
 import yaml
 
 from src.config import (
+    ManifestRunIdError,
     ManifestWriteError,
     RunManifest,
     build_run_manifest,
     compute_config_hash,
     load_config,
+    read_dependency_lock_digest,
     read_git_state,
+    validate_run_id,
     write_run_manifest,
 )
 
@@ -62,11 +65,17 @@ def test_manifest_records_required_fields(resolved):
     assert payload["git_dirty"] is None or isinstance(payload["git_dirty"], bool)
 
 
-def test_manifest_run_id_embeds_timestamp_and_hash_prefix(resolved):
+def test_manifest_run_id_embeds_timestamp_hash_pid_and_nonce(resolved):
     moment = datetime(2026, 11, 19, 20, 16, 5, tzinfo=timezone.utc)
     manifest = build_run_manifest(resolved, now=moment)
-    assert re.fullmatch(r"20261119T201605Z-[0-9a-f]{8}", manifest.run_id)
-    assert manifest.run_id.endswith(manifest.config_hash[:8])
+    assert re.fullmatch(r"20261119T201605Z-[0-9a-f]{8}-[0-9a-f]+-[0-9a-f]{12}", manifest.run_id)
+    assert manifest.run_id.startswith(f"20261119T201605Z-{manifest.config_hash[:8]}-")
+
+
+def test_same_timestamp_same_config_yields_distinct_run_ids(resolved):
+    moment = datetime(2026, 11, 19, 20, 16, 5, tzinfo=timezone.utc)
+    ids = {build_run_manifest(resolved, now=moment).run_id for _ in range(32)}
+    assert len(ids) == 32  # pid + random nonce defeat second-level collisions
 
 
 def test_manifest_versions_cover_python_torch_transformers_datasets(resolved):
@@ -106,6 +115,53 @@ def test_git_state_is_reported_not_refused():
     sha, dirty = read_git_state()
     assert (isinstance(sha, str) and sha) or sha == "unknown"
     assert dirty is None or isinstance(dirty, bool)
+
+
+@pytest.mark.parametrize(
+    "run_id",
+    ["", "   ", ".", "..", "../escape", "a/b", "a\\b", "/tmp/absolute", "run id", "..\\evil"],
+)
+def test_traversing_or_non_portable_run_ids_are_rejected(run_id):
+    with pytest.raises(ManifestRunIdError) as excinfo:
+        validate_run_id(run_id)
+    assert excinfo.value.code == "MANIFEST_INVALID_RUN_ID"
+
+
+@pytest.mark.parametrize("run_id", ["../escape", "/tmp/absolute", "nested/run"])
+def test_write_rejects_traversal_before_creating_anything(resolved, tmp_path, run_id):
+    manifest = build_run_manifest(resolved)
+    object.__setattr__(manifest, "run_id", run_id)  # frozen dataclass: simulate a forged ID
+    runs = tmp_path / "runs"
+    with pytest.raises(ManifestRunIdError):
+        write_run_manifest(manifest, runs)
+    assert not runs.exists()
+
+
+def test_write_is_atomic_without_leftover_tmp_files(resolved, tmp_path):
+    manifest = build_run_manifest(resolved, now=datetime(2026, 11, 19, 20, 16, tzinfo=timezone.utc))
+    runs = tmp_path / "runs"
+    target = write_run_manifest(manifest, runs)
+    assert [p.name for p in target.parent.iterdir()] == ["manifest.json"]
+    assert json.loads(target.read_text(encoding="utf-8")) == manifest.to_dict()
+
+
+def test_git_state_is_read_relative_to_repo_root_from_any_cwd(resolved, tmp_path, monkeypatch):
+    expected = read_git_state()
+    monkeypatch.chdir(tmp_path)
+    assert read_git_state() == expected
+    manifest = build_run_manifest(resolved)
+    assert manifest.git_sha == expected[0]
+
+
+def test_lock_digest_is_recorded_when_lock_exists(resolved, tmp_path, monkeypatch):
+    import src.config.manifest as manifest_module
+
+    lock = tmp_path / "requirements.lock"
+    lock.write_text("torch==2.15.0\n", encoding="utf-8")
+    monkeypatch.setattr(manifest_module, "_LOCK_FILE", lock)
+    digest = read_dependency_lock_digest()
+    assert digest is not None and re.fullmatch(r"[0-9a-f]{64}", digest)
+    assert build_run_manifest(resolved).dependency_lock_sha256 == digest
 
 
 def test_run_manifest_is_frozen_dataclass(resolved):

@@ -90,6 +90,26 @@ class TestAssignmentRule:
         assert [e.example_id for e in result.examples] == [e.example_id for e in examples]
 
 
+class TestCoarseGroups:
+    def test_coarse_groups_still_reach_every_split(self):
+        # Four atomic groups of three rows used to yield 9/3/0: the small
+        # test quota was starved by the large train quota.
+        examples = []
+        uid = 50000
+        for group in range(4):
+            for _ in range(3):
+                uid += 1
+                examples.append(
+                    make_example(uid=uid, family="choice", group_id=f"coarse-{group}")
+                )
+        result = split(examples, seed=13)
+        counts = result.manifest.counts["choice"]
+        assert all(counts[name] > 0 for name in ("train", "dev", "test"))
+        assert sum(counts.values()) == len(examples)
+        assert len(result.examples) == len(examples)
+        assert result.manifest.excluded_thirteen_gram_rows == 0
+
+
 class TestOodHandling:
     def test_ood_source_contributes_zero_rows_to_train_and_dev(self):
         ood = [

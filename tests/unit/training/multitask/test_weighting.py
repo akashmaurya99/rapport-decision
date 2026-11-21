@@ -348,7 +348,11 @@ def test_manifest_fragment_reaches_the_run_registry(tmp_path):
     manifest = {
         "run_id": "run-manifest",
         "config_hash": "deadbeef" * 8,
-        "data_fingerprint": "fingerprint-123",
+        "data_fingerprint": "ab" * 32,
+        "git_sha": "deadbee",
+        "seed": 13,
+        "device": "cuda:0",
+        "versions": {"python": "3.11.0"},
         **fragment,
     }
     (run_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")

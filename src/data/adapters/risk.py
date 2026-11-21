@@ -37,6 +37,7 @@ encoding silently.
 
 from __future__ import annotations
 
+import unicodedata
 from typing import Any, Iterable, Mapping
 
 from src.data.core.schema import RISK_CATEGORY_COUNT
@@ -84,9 +85,10 @@ def _labels(row: Mapping[str, Any]) -> list[str]:
                 ADAPTOR_BAD_TYPE,
                 f"risk label at index {i} must be a non-empty string",
             )
-        label = item.strip()
-        if label not in seen:
-            seen.add(label)
+        label = unicodedata.normalize("NFC", item.strip())
+        key = label.casefold()  # category ids are case-insensitive
+        if key not in seen:
+            seen.add(key)
             labels.append(label)
     if len(labels) > RISK_CATEGORY_COUNT:
         raise _RecordFailure(

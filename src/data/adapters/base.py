@@ -191,9 +191,39 @@ class Adapter(Protocol):
 # --- shared helpers -----------------------------------------------------------
 
 
+def _stringify_keys(value: Any) -> Any:
+    """Recursively coerce mapping keys to strings for canonical JSON.
+
+    Raw source rows occasionally arrive with non-string mapping keys (for
+    example an integer column index mixed with named columns). ``json.dumps``
+    with ``sort_keys=True`` raises ``TypeError`` on heterogeneous key types;
+    coercing is deterministic and keeps the fingerprint usable.
+    """
+    if isinstance(value, Mapping):
+        output: dict[str, Any] = {}
+        for key, item in value.items():
+            normalized = str(key)
+            if normalized in output:
+                raise AdapterError(
+                    f"raw row contains colliding mapping keys after string coercion: {normalized!r}"
+                )
+            output[normalized] = _stringify_keys(item)
+        return output
+    if isinstance(value, (list, tuple)):
+        return [_stringify_keys(item) for item in value]
+    return value
+
+
 def fingerprint_row(row: Mapping[str, Any]) -> str:
-    """Stable fingerprint of one raw row (canonical JSON, sha256)."""
-    blob = json.dumps(row, sort_keys=True, default=str, ensure_ascii=False)
+    """Stable fingerprint of one raw row (canonical JSON, sha256).
+
+    Mapping keys are coerced to strings before serialization, so a row with
+    non-string keys is fingerprinted rather than rejected with a raw
+    ``TypeError``. String-keyed rows keep the same fingerprint as before.
+    """
+    blob = json.dumps(
+        _stringify_keys(row), sort_keys=True, default=str, ensure_ascii=False
+    )
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 

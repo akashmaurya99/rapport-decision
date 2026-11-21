@@ -1,4 +1,10 @@
 # Packaging for RAPPORT. Keep `version` in sync with `src/rapport/__init__.py`.
+#
+# Dependencies are pinned in requirements.lock (generated from the validated
+# dev venv). Install reproducibly with:
+#   python -m pip install -c requirements.lock -e .[dev]
+# The constraints file is authoritative for CI; this [project].dependencies
+# list stays unpinned for humans installing the package directly.
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
@@ -29,11 +35,42 @@ dev = [
   "mypy",
 ]
 
+# All production code imports `src.*`; the old flat layout exposed top-level
+# `config`, `model`, `data`, ... packages which do not exist at runtime. We
+# expose exactly the `src` package tree plus the public `rapport` package.
+# Namespace subpackages (no __init__.py) are listed explicitly so nothing is
+# discovered by accident; add new src subpackages here when they are created.
 [tool.setuptools]
-package-dir = { "" = "src" }
+package-dir = { "" = ".", "src" = "src", "rapport" = "src/rapport" }
+packages = [
+  "rapport",
+  "src",
+  "src.calibration",
+  "src.config",
+  "src.data",
+  "src.data.acquire",
+  "src.data.adapters",
+  "src.data.clean",
+  "src.data.core",
+  "src.data.mixture",
+  "src.data.mixture.presets",
+  "src.data.splits",
+  "src.distill",
+  "src.evaluation",
+  "src.inference",
+  "src.model",
+  "src.model.core",
+  "src.model.head",
+  "src.ops",
+  "src.rapport",
+  "src.tokenization",
+  "src.training",
+  "src.training.core",
+  "src.training.multitask",
+]
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[tool.setuptools.package-data]
+"src.data.mixture.presets" = ["*.yaml"]
 
 [tool.ruff]
 line-length = 100

@@ -9,6 +9,7 @@ starter and 115.6k full presets), :func:`parse_mixture_document`,
 """
 
 from .errors import (
+    MixtureAvailabilityError,
     MixtureConfigError,
     MixtureConfigFieldError,
     MixtureError,
@@ -16,6 +17,7 @@ from .errors import (
     MixtureFingerprintError,
     MixtureFingerprintMismatchError,
     MixtureInputError,
+    MixtureQuarantinedSourceError,
     MixtureSourceError,
 )
 from .loader import (
@@ -24,6 +26,7 @@ from .loader import (
     MixtureDeclaration,
     load_mixture,
     load_preset,
+    load_source_statuses,
     parse_mixture_document,
     preset_path,
 )
@@ -32,6 +35,7 @@ from .mixture import (
     MixtureOrder,
     MixtureSlot,
     MixtureSource,
+    availability_rows_by_id,
     parse_family_entries,
     parse_source_entry,
     parse_sources_mapping,
@@ -42,6 +46,7 @@ __all__ = [
     "DEFAULT_MIXTURE_NAME",
     "PRESET_NAMES",
     "PRESETS_DIR",
+    "MixtureAvailabilityError",
     "MixtureConfigError",
     "MixtureConfigFieldError",
     "MixtureDeclaration",
@@ -50,12 +55,15 @@ __all__ = [
     "MixtureFingerprintError",
     "MixtureFingerprintMismatchError",
     "MixtureInputError",
+    "MixtureQuarantinedSourceError",
     "MixtureOrder",
     "MixtureSlot",
     "MixtureSource",
     "MixtureSourceError",
+    "availability_rows_by_id",
     "load_mixture",
     "load_preset",
+    "load_source_statuses",
     "parse_family_entries",
     "parse_mixture_document",
     "parse_source_entry",

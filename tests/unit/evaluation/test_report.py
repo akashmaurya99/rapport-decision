@@ -61,6 +61,7 @@ def make_metrics(
                 "ece_pooled": ece_pooled,
                 "ece_bucket_macro": ece_bucket_macro,
                 "selective_accuracy_80": sel80,
+                "selective_actual_coverage": {"80": 0.80},
                 "accuracy": full,
                 "brier": 0.1,
                 "nll": 0.3,
@@ -81,7 +82,11 @@ def make_robustness(*, ood_accuracy: float = 0.72, fingerprint: str | None = FIN
     ood = {
         "accuracy": ood_accuracy,
         "ood_source": "UltraFeedback-binarized",
+        "source": "UltraFeedback-binarized",
+        "sources": ["UltraFeedback-binarized"],
         "n_rows": 8000,
+        "n_train_rows": 0,
+        "n_dev_rows": 0,
         "empty": False,
         "by_family": {},
     }
@@ -109,6 +114,45 @@ def make_robustness(*, ood_accuracy: float = 0.72, fingerprint: str | None = FIN
     }
 
 
+THRESHOLDS_FP = "ab" * 32
+
+
+def make_int8_export(*, passed: bool = False, drop: float = 0.4) -> dict:
+    conditions = {
+        "choice_accuracy_drop": True,
+        "bucket_macro_ece_rise": True,
+        "cosine_score_path_fp32": True,
+        "serialized_size": True,
+        "p95_latency_speedup": True,
+    }
+    if not passed:
+        conditions["p95_latency_speedup"] = False
+    artifact = "int8" if passed else "fp16"
+    return {
+        "gate_outcome": {"passed": passed, "artifact": artifact, "conditions": conditions},
+        "retained_artifact": artifact,
+        "validated_artifacts": {
+            "fp16": {
+                "path": "/artifacts/model-fp16.onnx",
+                "size_bytes": 70 * 1024 * 1024,
+                "onnx_checker": True,
+                "ort_session": True,
+                "parity_validated": True,
+                "sha256": "ab" * 32,
+            },
+            "int8": {
+                "path": "/artifacts/model-int8.onnx",
+                "size_bytes": 34 * 1024 * 1024,
+                "onnx_checker": True,
+                "ort_session": True,
+                "parity_validated": True,
+                "sha256": "cd" * 32,
+            },
+        },
+        "accuracy_drop_points": drop,
+    }
+
+
 def make_benchmark() -> dict:
     return {
         "p50_batch1_ms": 9.0,
@@ -116,7 +160,47 @@ def make_benchmark() -> dict:
         "throughput_batch32": 350.0,
         "parameters": 33_460_000,
         "fp32_size_bytes": 130 * 1024 * 1024,
-        "int8": {"accuracy_drop_points": 0.4},
+        "device": "NVIDIA T4",
+        "precision": "fp16",
+        "batch": [1, 32],
+        "latency_method": "synchronized cuda events with torch.cuda.synchronize",
+        "latency_synchronized": True,
+        "int8": make_int8_export(),
+    }
+
+
+def make_y7(aegis_recall: float | dict[str, float], *, fingerprint: str = FINGERPRINT) -> dict:
+    recalls = (
+        dict(aegis_recall) if isinstance(aegis_recall, dict)
+        else {category: aegis_recall for category in RISK_CATEGORIES}
+    )
+    measurements = {}
+    for category, recall in recalls.items():
+        tp = round(100 * recall)
+        measurements[category] = {
+            "tp": tp, "fp": 0, "fn": 100 - tp, "tn": 1000,
+            "recall": tp / 100, "fpr": 0.0,
+        }
+    return {
+        "cohort": "aegis",
+        "split_manifest_fingerprint": fingerprint,
+        "thresholds_from": "dev",
+        "risk_thresholds_fingerprint": THRESHOLDS_FP,
+        "fpr_threshold": 0.10,
+        "measurements": measurements,
+        "aegis_risk_recall_at_fpr": dict(recalls),
+    }
+
+
+def make_y8(rate: float = 0.05, *, fingerprint: str = FINGERPRINT) -> dict:
+    return {
+        "cohort": "xstest",
+        "split_manifest_fingerprint": fingerprint,
+        "thresholds_from": "dev",
+        "risk_thresholds_fingerprint": THRESHOLDS_FP,
+        "xstest_over_refusal_rate": rate,
+        "n_safe": 200,
+        "n_flagged": round(rate * 200),
     }
 
 
@@ -152,22 +236,42 @@ def make_runs(
             "versions": {"python": "3.12.0", "torch": "2.4.0"},
             "metrics": json.loads(json.dumps(base_metrics)),
         }
-        if seed == seeds[0]:
-            if robustness == "default":
-                run["robustness"] = make_robustness()
-            elif robustness is not None:
-                run["robustness"] = robustness
-            if benchmark == "default":
-                run["benchmark"] = make_benchmark()
-            elif benchmark is not None:
-                run["benchmark"] = benchmark
-            run["evidence"] = {
-                "reproducibility_delta_points": 0.1,
-                "resume": {"abs_diff": 1e-5},
-                "keyword_risk_baseline": make_keyword_baseline(),
-            }
-            if evidence:
-                run["evidence"].update(evidence)
+        if robustness == "default":
+            run["robustness"] = make_robustness()
+        elif robustness is not None:
+            run["robustness"] = robustness
+        if benchmark == "default":
+            run["benchmark"] = make_benchmark()
+        elif benchmark is not None:
+            run["benchmark"] = benchmark
+        run["evidence"] = {
+            "reproducibility": {
+                "run_ids": ["run-13-a", "run-13-b"],
+                "seed": 13,
+                "config_hash": "cfg-repro",
+                "data_fingerprint": fingerprint or FINGERPRINT,
+                "metric": "choice.test.accuracy",
+                "delta_points": 0.1,
+            },
+            "resume": {
+                "abs_diff": 1e-5,
+                "resumed_from": "/runs/killed/checkpoint_step5.pt",
+                "resumed_step": 5,
+                "next_step": 6,
+            },
+            "keyword_risk_baseline": make_keyword_baseline(),
+            "y7": make_y7(
+                base_metrics["risk"]["test"]["risk_recall_at_fpr"],
+                fingerprint=fingerprint or FINGERPRINT,
+            ),
+            "y8": make_y8(
+                base_metrics["risk"]["test"]["over_refusal_rate"],
+                fingerprint=fingerprint or FINGERPRINT,
+            ),
+            "int8_export": make_int8_export(),
+        }
+        if evidence:
+            run["evidence"].update(evidence)
         runs.append(run)
     return runs
 
@@ -269,16 +373,24 @@ def test_y1_pass_when_model_clears_b3_margin(tmp_path):
     assert statuses["Y1"].status == "pass"
 
 
-def test_y7_missing_input_renders_not_measured_never_pass(tmp_path):
+def test_y7_missing_evidence_block_renders_not_measured_never_pass(tmp_path):
     runs = make_runs()
     for run in runs:
-        run["metrics"]["risk"]["test"].pop("risk_recall_at_fpr", None)
-        run.get("evidence", {}).pop("keyword_risk_baseline", None)
+        run.get("evidence", {}).pop("y7", None)
     result = build_report(runs, make_baselines(), make_ablations(), tmp_path)
     statuses = {row.id: row for row in result.verdicts}
     assert statuses["Y7"].status == "not-measured"
     assert statuses["Y7"].status != "pass"
-    assert any("aegis" in key for key in statuses["Y7"].missing)
+    assert any("cohort" in key for key in statuses["Y7"].missing)
+
+
+def test_y7_generic_metric_payload_is_not_accepted(tmp_path):
+    """A bare metrics.risk.test.risk_recall_at_fpr is an oracle diagnostic, not evidence."""
+    runs = make_runs()
+    for run in runs:
+        run.get("evidence", {}).pop("y7", None)
+    result = build_report(runs, make_baselines(), make_ablations(), tmp_path)
+    assert {row.id: row for row in result.verdicts}["Y7"].status == "not-measured"
 
 
 def test_y7_missing_keyword_comparator_renders_not_measured(tmp_path):
@@ -291,6 +403,20 @@ def test_y7_missing_keyword_comparator_renders_not_measured(tmp_path):
     assert any("keyword" in key for key in statuses["Y7"].missing)
 
 
+def test_y7_wrong_cohort_or_fingerprint_is_not_measured(tmp_path):
+    runs = make_runs()
+    runs[0]["evidence"]["y7"]["cohort"] = "not-aegis"
+    result = build_report(runs, make_baselines(), make_ablations(), tmp_path)
+    assert {row.id: row for row in result.verdicts}["Y7"].status == "not-measured"
+
+    runs = make_runs()
+    runs[0]["evidence"]["y7"]["split_manifest_fingerprint"] = FINGERPRINT_OTHER
+    result = build_report(runs, make_baselines(), make_ablations(), tmp_path)
+    row = {r.id: r for r in result.verdicts}["Y7"]
+    assert row.status == "not-measured"
+    assert any("fingerprint" in key for key in row.missing)
+
+
 def test_y7_pass_and_fail_by_weakest_category(tmp_path):
     passing = build_report(make_runs(), make_baselines(), make_ablations(), tmp_path)
     assert {row.id: row for row in passing.verdicts}["Y7"].status == "pass"
@@ -298,6 +424,8 @@ def test_y7_pass_and_fail_by_weakest_category(tmp_path):
     weak = {category: 0.90 for category in RISK_CATEGORIES}
     weak["self_harm"] = 0.50
     runs = make_runs(metrics=make_metrics(aegis_recall=weak))
+    # Rebuild the y7 evidence block from the modified recalls (fixture copies base_metrics).
+    runs[0]["evidence"]["y7"] = make_y7(weak)
     failing = build_report(runs, make_baselines(), make_ablations(), tmp_path)
     row = {r.id: r for r in failing.verdicts}["Y7"]
     assert row.status == "fail"
@@ -307,15 +435,23 @@ def test_y7_pass_and_fail_by_weakest_category(tmp_path):
 def test_y8_missing_renders_not_measured_never_pass(tmp_path):
     runs = make_runs()
     for run in runs:
-        run["metrics"]["risk"]["test"].pop("over_refusal_rate", None)
+        run.get("evidence", {}).pop("y8", None)
     result = build_report(runs, make_baselines(), make_ablations(), tmp_path)
     statuses = {row.id: row for row in result.verdicts}
     assert statuses["Y8"].status == "not-measured"
     assert statuses["Y8"].status != "pass"
 
 
+def test_y8_wrong_cohort_is_not_measured(tmp_path):
+    runs = make_runs()
+    runs[0]["evidence"]["y8"]["cohort"] = "xstest-wrong"
+    result = build_report(runs, make_baselines(), make_ablations(), tmp_path)
+    assert {row.id: row for row in result.verdicts}["Y8"].status == "not-measured"
+
+
 def test_y8_fail_when_over_refusal_above_limit(tmp_path):
     runs = make_runs(metrics=make_metrics(over_refusal=0.25))
+    runs[0]["evidence"]["y8"] = make_y8(0.25)
     result = build_report(runs, make_baselines(), make_ablations(), tmp_path)
     row = {r.id: r for r in result.verdicts}["Y8"]
     assert row.status == "fail"
@@ -377,6 +513,35 @@ def test_exit_code_semantics():
     assert exit_code([], negative_results=["none observed"]) == 0
 
 
+def test_exit_code_fails_on_not_measured_blocking():
+    # Acceptance mode: anything other than 'pass' on a blocking row fails.
+    assert exit_code([{"id": "Y1", "status": "not-measured", "blocking": True}]) == 1
+    assert exit_code([
+        {"id": "Y1", "status": "pass", "blocking": True},
+        {"id": "Y2", "status": "not-measured", "blocking": True},
+    ]) == 1
+    assert exit_code([{"id": "Y1", "status": "not-measured", "blocking": False}]) == 0
+    # Starter (non-acceptance) mode: only real fails matter.
+    assert exit_code([
+        {"id": "Y1", "status": "not-measured", "blocking": True}
+    ], starter=True) == 0
+    assert exit_code([
+        {"id": "Y1", "status": "not-measured", "blocking": True},
+        {"id": "Y2", "status": "fail", "blocking": True},
+    ], starter=True) == 1
+
+
+def test_all_not_measured_fails_acceptance_but_passes_starter(tmp_path):
+    result = build_report([], {}, {}, tmp_path)
+    assert all(row.status == "not-measured" for row in result.verdicts)
+    assert result.exit_code == 1
+    data = json.loads(result.report_json_path.read_text())
+    assert data["mode"] == "acceptance"
+    starter = build_report([], {}, {}, tmp_path, starter=True)
+    assert starter.exit_code == 0
+    assert json.loads(starter.report_json_path.read_text())["mode"] == "starter"
+
+
 def test_metrics_render_per_family_per_split_with_three_seeds(tmp_path):
     result = build_report(make_runs(), make_baselines(), make_ablations(), tmp_path)
     md = result.report_md_path.read_text()
@@ -427,16 +592,16 @@ def test_verdicts_missing_evidence_all_not_measured(tmp_path):
     result = build_report([], {}, {}, tmp_path)
     assert all(row.status == "not-measured" for row in result.verdicts)
     assert all(row.missing for row in result.verdicts)
-    assert result.exit_code == 0  # not-measured is not a fail
+    assert result.exit_code == 1  # not-measured on a blocking row fails acceptance
 
 
 def test_y14_duplicate_seed_gap_fail_and_pass(tmp_path):
     # two recorded runs of seed 13: 0.60 and 0.70 → 10 points apart (> 0.5)
     runs = make_runs()
     for run in runs:
+        run["evidence"].pop("reproducibility", None)
         if run["run_id"] == "run-13":
             run["metrics"]["choice"]["test"]["accuracy"] = 0.60
-            run["evidence"].pop("reproducibility_delta_points", None)
     repeat = json.loads(json.dumps(runs[0]))
     repeat["run_id"] = "run-13-repeat"
     repeat["metrics"]["choice"]["test"]["accuracy"] = 0.70
@@ -447,9 +612,9 @@ def test_y14_duplicate_seed_gap_fail_and_pass(tmp_path):
 
     close = make_runs()
     for run in close:
+        run["evidence"].pop("reproducibility", None)
         if run["run_id"] == "run-13":
             run["metrics"]["choice"]["test"]["accuracy"] = 0.700
-            run["evidence"].pop("reproducibility_delta_points", None)
     repeat = json.loads(json.dumps(close[0]))
     repeat["run_id"] = "run-13-repeat"
     repeat["metrics"]["choice"]["test"]["accuracy"] = 0.704  # 0.4 points apart
@@ -457,6 +622,79 @@ def test_y14_duplicate_seed_gap_fail_and_pass(tmp_path):
     result = build_report(close, make_baselines(), make_ablations(), tmp_path)
     row = {r.id: r for r in result.verdicts}["Y14"]
     assert row.status == "pass"
+
+
+def test_y14_exact_duplicates_and_nll_only_difference_pass(tmp_path):
+    runs = make_runs()
+    for run in runs:
+        run["evidence"].pop("reproducibility", None)
+    repeat = json.loads(json.dumps(runs[0]))
+    repeat["run_id"] = "run-13-repeat"
+    exact = build_report(runs + [repeat], make_baselines(), make_ablations(), tmp_path)
+    row = {r.id: r for r in exact.verdicts}["Y14"]
+    assert row.status == "pass"
+    assert "0.000" in row.detail
+
+    # Only NLL differs between duplicate seeds: Y14 is accuracy reproducibility.
+    repeat_nll = json.loads(json.dumps(runs[0]))
+    repeat_nll["run_id"] = "run-13-repeat"
+    repeat_nll["metrics"]["probability"]["test"]["nll"] = 0.9
+    nll_only = build_report(runs + [repeat_nll], make_baselines(), make_ablations(), tmp_path)
+    assert {r.id: r for r in nll_only.verdicts}["Y14"].status == "pass"
+
+
+def test_y5_requires_same_cohort_for_selective_and_full_accuracy(tmp_path):
+    metrics = make_metrics()
+    # Selective accuracy on a different family than full accuracy.
+    metrics["abstention"]["test"]["selective_accuracy_80"] = 0.78
+    del metrics["probability"]["test"]["selective_accuracy_80"]
+    result = build_report(
+        make_runs(metrics=metrics), make_baselines(), make_ablations(), tmp_path
+    )
+    row = {r.id: r for r in result.verdicts}["Y5"]
+    assert row.status == "not-measured"
+    assert result.exit_code == 1
+
+
+def test_y9_y10_require_t4_fp16_batching_and_synchronized_timing(tmp_path):
+    benchmark = make_benchmark()
+    benchmark["device"] = "cpu"
+    benchmark["precision"] = ["fp32"]
+    result = build_report(
+        make_runs(benchmark=benchmark), make_baselines(), make_ablations(), tmp_path
+    )
+    statuses = {r.id: r for r in result.verdicts}
+    assert statuses["Y9"].status == "not-measured"
+    assert statuses["Y10"].status == "not-measured"
+    assert any("T4" in m for m in statuses["Y9"].missing)
+
+
+def test_y12_bare_artifact_rejected_is_not_measured(tmp_path):
+    runs = make_runs(evidence={"int8_export": {"artifact_rejected": True}})
+    result = build_report(runs, make_baselines(), make_ablations(), tmp_path)
+    row = {r.id: r for r in result.verdicts}["Y12"]
+    assert row.status == "not-measured"
+    assert any("gate_outcome" in m for m in row.missing)
+
+
+def test_y12_real_gate_rejection_keeps_fp16_and_passes(tmp_path):
+    runs = make_runs(evidence={"int8_export": make_int8_export(passed=False)})
+    result = build_report(runs, make_baselines(), make_ablations(), tmp_path)
+    row = {r.id: r for r in result.verdicts}["Y12"]
+    assert row.status == "pass"
+    assert "quantization gate" in row.detail
+
+
+def test_later_seed_failure_is_not_hidden_by_first_passing_block(tmp_path):
+    runs = make_runs()
+    # First seed passes permutation; a later seed fails it.
+    runs[1]["robustness"] = make_robustness(within_tolerance=False)
+    result = build_report(runs, make_baselines(), make_ablations(), tmp_path)
+    row = {r.id: r for r in result.verdicts}["Y6"]
+    assert row.status == "fail"
+    assert result.exit_code == 1
+    data = json.loads(result.report_json_path.read_text())
+    assert any("worst value" in w for w in data["warnings"])
 
 
 def test_verdict_rows_rendered_in_order(tmp_path):
@@ -481,13 +719,13 @@ def test_registry_like_runs_are_consumed(tmp_path):
         run_dir.mkdir(parents=True)
         manifest = {
             "run_id": f"seed-{seed}",
-            "config_hash": "cfg",
+            "config_hash": "a" * 64,
             "data_fingerprint": FINGERPRINT,
             "seed": seed,
             "device": "cuda:0",
             "git_sha": "deadbee",
             "determinism": "deterministic",
-            "versions": {"torch": "2.4.0"},
+            "versions": {"python": "3.11.0", "torch": "2.4.0"},
         }
         (run_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
 

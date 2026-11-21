@@ -41,14 +41,17 @@ import math
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
-from src.data.core.schema import TASK_FAMILIES
+from src.data.acquire.manifest import STATUS_ADMITTED
+from src.data.core.schema import TASK_FAMILIES, DecisionExample
 from src.data.splits.fingerprint import is_sha256_hex
 
 from .errors import (
+    MixtureAvailabilityError,
     MixtureFamilyError,
     MixtureFingerprintError,
     MixtureFingerprintMismatchError,
     MixtureInputError,
+    MixtureQuarantinedSourceError,
     MixtureSourceError,
 )
 
@@ -301,6 +304,87 @@ def _slot_key(fingerprint: str, seed: int, family: str, source: str, index: int)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _example_id_key(
+    fingerprint: str, seed: int, family: str, source: str, example_id: str
+) -> str:
+    """Deterministic selection key for a real example inside one source bucket.
+
+    Derived from the recorded fingerprint and seed, so which real rows a
+    slot binds to is reproducible on every platform and independent of the
+    order rows were supplied in.
+    """
+    payload = [_SLOT_DOMAIN, "example", fingerprint, seed, family, source, example_id]
+    canonical = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def availability_rows_by_id(
+    available_rows: Mapping[str, object] | Sequence[DecisionExample],
+) -> dict[str, DecisionExample]:
+    """Return eligible TRAIN rows keyed by their occurrence identity.
+
+    Content hashes are intentionally option-order invariant, so the preference
+    adapter's two de-biasing orientations share ``example_id``. A deterministic
+    ``#occurrence=N`` suffix keeps those emissions (and only those) separately
+    addressable. Dev/test/OOD rows are never eligible for optimization.
+    """
+    if isinstance(available_rows, Mapping):
+        rows: list[object] = [
+            row for group in available_rows.values() for row in _as_sequence(group)
+        ]
+    else:
+        rows = list(available_rows)
+    totals: dict[str, int] = {}
+    for row in rows:
+        if isinstance(row, DecisionExample) and row.split == "train":
+            totals[row.example_id] = totals.get(row.example_id, 0) + 1
+    seen: dict[str, int] = {}
+    output: dict[str, DecisionExample] = {}
+    for position, row in enumerate(rows):
+        if not isinstance(row, DecisionExample):
+            raise MixtureAvailabilityError(
+                f"available_rows[{position}] is a {type(row).__name__}, "
+                "expected DecisionExample",
+                family="",
+                source="",
+                requested=0,
+                available=0,
+            )
+        if row.split != "train":
+            continue
+        occurrence = seen.get(row.example_id, 0)
+        seen[row.example_id] = occurrence + 1
+        key = (
+            f"{row.example_id}#occurrence={occurrence}"
+            if totals[row.example_id] > 1
+            else row.example_id
+        )
+        output[key] = row
+    return output
+
+
+def _availability_index(
+    available_rows: Mapping[str, object] | Sequence[DecisionExample] | None,
+) -> dict[tuple[str, str], list[str]] | None:
+    """Group eligible train rows by ``(task_family, source)``."""
+    if available_rows is None:
+        return None
+    index: dict[tuple[str, str], list[str]] = {}
+    for identity, row in availability_rows_by_id(available_rows).items():
+        index.setdefault((row.task_family, row.source), []).append(identity)
+    return {key: sorted(ids) for key, ids in index.items()}
+
+
+def _as_sequence(value: object) -> Sequence[object]:
+    if isinstance(value, (str, bytes)) or isinstance(value, DecisionExample):
+        return (value,)
+    if isinstance(value, Sequence):
+        return value
+    if isinstance(value, Mapping):
+        return (value,)
+    return (value,)
+
+
 def _effective_weights(
     parsed: Mapping[str, tuple[MixtureSource, ...]],
     weights: object,
@@ -373,6 +457,9 @@ def sample_mixture(
     weights: Mapping[str, object] | None,
     seed: object,
     fingerprint: object,
+    *,
+    available_rows: Mapping[str, object] | Sequence[DecisionExample] | None = None,
+    source_status: Any = None,
 ) -> MixtureOrder:
     """Return the deterministic assignment of mixture slots to a global order.
 
@@ -386,6 +473,17 @@ def sample_mixture(
     overrides per-entry weights for the families it names. Families it does
     not name fall back to their (common) entry weight, then to a
     row-proportional default.
+
+    ``available_rows`` (real :class:`DecisionExample` records, flat or keyed
+    by family) binds every slot to a distinct real ``example_id`` from the
+    declared ``(family, source)``. Requests that exceed availability, or
+    source/family combinations with no rows, are fatal. Without it the
+    legacy synthetic slot ids are retained for declaration-only use.
+
+    ``source_status`` is either a ``source -> status`` mapping (or manifest
+    objects) or a directory of acquisition manifests. Any source marked
+    ``quarantine`` is refused with :class:`MixtureQuarantinedSourceError`
+    (TASK-07 acceptance), never silently dropped.
     """
     from .loader import MixtureDeclaration  # local import: loader imports this module
 
@@ -401,6 +499,33 @@ def sample_mixture(
     seed_value = _validate_seed(seed)
     fingerprint_value = _validate_fingerprint(fingerprint)
     _check_pinned_fingerprint(pinned, fingerprint_value)
+
+    if source_status is not None:
+        from .loader import load_source_statuses
+
+        statuses = load_source_statuses(source_status)
+        for family, entries in parsed.items():
+            for entry in entries:
+                status = statuses.get(entry.source)
+                # Supplying provenance opts into fail-closed enforcement:
+                # missing, unknown and malformed statuses are not admission.
+                if status != STATUS_ADMITTED:
+                    raise MixtureQuarantinedSourceError(
+                        f"source {entry.source!r} declared for family {family!r} has "
+                        f"status {status!r}, not {STATUS_ADMITTED!r}; refusing to build "
+                        "a training mixture without explicit admission",
+                        source=entry.source,
+                        status=status or "missing",
+                    )
+
+    if available_rows is not None and source_status is None:
+        raise MixtureQuarantinedSourceError(
+            "real-row training binding requires explicit source-status evidence; "
+            "missing manifests must never authorize optimization",
+            source="",
+            status="missing",
+        )
+    availability = _availability_index(available_rows)
 
     effective_weights = _effective_weights(parsed, weights)
 
@@ -434,17 +559,57 @@ def sample_mixture(
                     )
                 )
     slots.sort(key=lambda slot: (slot.key, slot.family, slot.source, slot.index))
-    ordered = tuple(
-        MixtureSlot(
-            order=position,
-            family=slot.family,
-            source=slot.source,
-            index=slot.index,
-            key=slot.key,
-            example_id=slot.example_id,
+
+    # Bind real rows when supplied: the deterministic slot schedule above is
+    # untouched; only the example_id each slot carries is resolved from the
+    # available (family, source) bucket, with a global dedupe across slots.
+    real_ids: dict[tuple[str, str], list[str]] = {}
+    if availability is not None:
+        used: set[str] = set()
+        for family in sorted(parsed):
+            for entry in parsed[family]:
+                bucket = availability.get((family, entry.source), [])
+                candidates = sorted(
+                    (example_id for example_id in bucket if example_id not in used),
+                    key=lambda example_id: _example_id_key(
+                        fingerprint_value, seed_value, family, entry.source, example_id
+                    ),
+                )
+                if len(candidates) < entry.rows:
+                    raise MixtureAvailabilityError(
+                        f"family {family!r} source {entry.source!r} requests "
+                        f"{entry.rows} rows but only {len(candidates)} distinct "
+                        "available rows remain after dedupe",
+                        family=family,
+                        source=entry.source,
+                        requested=entry.rows,
+                        available=len(candidates),
+                    )
+                chosen = candidates[: entry.rows]
+                used.update(chosen)
+                real_ids[(family, entry.source)] = chosen
+
+    pointers: dict[tuple[str, str], int] = {}
+    ordered_slots: list[MixtureSlot] = []
+    for position, slot in enumerate(slots):
+        if availability is None:
+            example_id = slot.example_id
+        else:
+            bucket_key = (slot.family, slot.source)
+            cursor = pointers.get(bucket_key, 0)
+            example_id = real_ids[bucket_key][cursor]
+            pointers[bucket_key] = cursor + 1
+        ordered_slots.append(
+            MixtureSlot(
+                order=position,
+                family=slot.family,
+                source=slot.source,
+                index=slot.index,
+                key=slot.key,
+                example_id=example_id,
+            )
         )
-        for position, slot in enumerate(slots)
-    )
+    ordered = tuple(ordered_slots)
 
     total_weight = sum(effective_weights.values())
     family_shares = {family: rows / total_rows for family, rows in family_rows.items()}

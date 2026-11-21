@@ -9,7 +9,24 @@ Design (training-strategy.md §8):
   written the same way;
 * on load, the sidecar digest is verified against the file **before**
   ``torch.load`` is reached — a mismatch raises
-  :class:`CheckpointHashMismatchError` and the payload is never deserialized.
+  :class:`CheckpointHashMismatchError` and the payload is never deserialized;
+* deserialization uses ``torch.load(..., weights_only=True)``. A matching
+  sidecar only proves the bytes were not altered on disk — it does **not**
+  make an untrusted pickle safe to unpickle, so the unsafe pickle path is
+  never taken (SECURITY: the sidecar is unkeyed and anyone who can write
+  ``runs/`` can forge both the checkpoint and its digest).
+
+The trainer's payload contains numpy RNG state (``numpy.random.get_state()``
+returns a tuple holding an ndarray), which the weights-only unpickler refuses.
+Rather than reverting to unsafe loading, :func:`save_checkpoint` converts
+numpy values into a small, explicitly marked dict of primitives (dtype string,
+shape, raw bytes) and :func:`load_checkpoint_payload` restores them before the
+payload is returned. The trainer's ``_restore_rng`` therefore still receives
+the original tuple-of-(str, ndarray, int, int, float) shape.
+
+Format version 2 is intentionally distinct from v1: v1 checkpoints were
+written with the unsafe loader and cannot be read under weights-only rules,
+so they are rejected with a clear error instead of being silently downgraded.
 
 ``latest_checkpoint`` implements the "resume auto" discovery used by the Colab
 re-run procedure (t4-optimization.md §10): highest step wins.
@@ -20,8 +37,11 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
+
+import numpy as np
 
 from .errors import (
     CheckpointError,
@@ -33,7 +53,8 @@ CHECKPOINT_PREFIX = "checkpoint_step"
 CHECKPOINT_SUFFIX = ".pt"
 SIDECAR_SUFFIX = ".sha256"
 TMP_SUFFIX = ".tmp"
-_FORMAT_VERSION = 1
+_FORMAT_VERSION = 2
+_SAFE_MARKER = "__rapport_numpy_value__"
 _NAME_RE = re.compile(r"^checkpoint_step(\d+)\.pt$")
 _CHUNK = 1 << 20
 
@@ -87,13 +108,122 @@ def _atomic_write(path: Path, data: bytes) -> None:
     _fsync_dir(path.parent)
 
 
+def _safe_key(key: Any) -> Any:
+    """Mapping keys must stay hashable and weights-only friendly."""
+    if isinstance(key, np.generic):
+        return key.item()
+    if isinstance(key, np.ndarray) and key.size == 1:
+        return key.item()
+    return key
+
+
+def _to_safe(value: Any) -> Any:
+    """Recursively turn numpy values into weights-only-safe primitives.
+
+    Supported values are the types a real trainer checkpoint contains:
+    tensors, strings, numbers, booleans, bytes, ``None``, lists, tuples,
+    mappings and numpy arrays/scalars. Anything else is a programming error
+    and is rejected at save time with :class:`CheckpointError` rather than
+    producing a checkpoint that cannot be loaded safely.
+    """
+    import torch
+
+    if isinstance(value, np.ndarray):
+        if value.dtype.hasobject:
+            raise CheckpointError("object arrays are not supported in safe checkpoints")
+        array = np.ascontiguousarray(value)
+        return {
+            _SAFE_MARKER: "ndarray",
+            "dtype": array.dtype.str,
+            "shape": list(array.shape),
+            "data": array.tobytes(),
+        }
+    if isinstance(value, np.generic):
+        if value.dtype.hasobject:
+            raise CheckpointError("object scalars are not supported in safe checkpoints")
+        return {
+            _SAFE_MARKER: "scalar",
+            "dtype": value.dtype.str,
+            "data": value.tobytes(),
+        }
+    if isinstance(value, Mapping):
+        if _SAFE_MARKER in value:
+            # Escape literal user mappings that happen to contain our reserved
+            # key; otherwise decoding would mistake them for ndarray metadata.
+            return {
+                _SAFE_MARKER: "mapping",
+                "items": [(_safe_key(key), _to_safe(item)) for key, item in value.items()],
+            }
+        return {_safe_key(key): _to_safe(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        # Preserve tuple-ness: random.setstate()/np.random.setstate() require it.
+        return tuple(_to_safe(item) for item in value)
+    if isinstance(value, list):
+        return [_to_safe(item) for item in value]
+    if isinstance(value, bytearray):
+        return bytes(value)
+    if isinstance(value, (str, int, float, bool, bytes, type(None))) or torch.is_tensor(value):
+        return value
+    raise CheckpointError(
+        f"unsupported checkpoint value type {type(value).__name__}; checkpoint payloads "
+        "must use tensors or weights-only-safe primitives"
+    )
+
+
+def _from_safe(value: Any) -> Any:
+    """Inverse of :func:`_to_safe`, with strict, typed payload validation."""
+    try:
+        if isinstance(value, Mapping):
+            if _SAFE_MARKER in value:
+                tag = value[_SAFE_MARKER]
+                if tag == "mapping":
+                    items = value["items"]
+                    if not isinstance(items, (list, tuple)):
+                        raise CheckpointError("invalid escaped mapping payload")
+                    return {key: _from_safe(item) for key, item in items}
+                if tag not in {"ndarray", "scalar"}:
+                    raise CheckpointError(f"unknown safe checkpoint value tag {tag!r}")
+                dtype = np.dtype(value["dtype"])
+                if dtype.hasobject:
+                    raise CheckpointError("object arrays are not supported in safe checkpoints")
+                data = bytes(value["data"])
+                if tag == "ndarray":
+                    shape = value["shape"]
+                    if not isinstance(shape, (list, tuple)) or any(
+                        type(dim) is not int or dim < 0 for dim in shape
+                    ):
+                        raise CheckpointError("invalid ndarray shape in checkpoint")
+                    expected = dtype.itemsize
+                    for dim in shape:
+                        expected *= dim
+                    if len(data) != expected:
+                        raise CheckpointError("ndarray byte length does not match dtype/shape")
+                    array = np.frombuffer(data, dtype=dtype).reshape(tuple(shape))
+                    return np.array(array, copy=True)  # writable, like the original
+                if len(data) != dtype.itemsize:
+                    raise CheckpointError("scalar byte length does not match dtype")
+                return np.frombuffer(data, dtype=dtype)[0]
+            return {key: _from_safe(item) for key, item in value.items()}
+        if isinstance(value, tuple):
+            return tuple(_from_safe(item) for item in value)
+        if isinstance(value, list):
+            return [_from_safe(item) for item in value]
+        return value
+    except CheckpointError:
+        raise
+    except (KeyError, TypeError, ValueError) as exc:
+        raise CheckpointError(f"malformed safe checkpoint value: {exc}") from exc
+
+
 def save_checkpoint(payload: dict[str, Any], directory: str | Path, step: int) -> Path:
-    """Serialize ``payload`` atomically and write its ``.sha256`` sidecar."""
+    """Serialize ``payload`` atomically (weights-only safe) plus its sidecar."""
     import torch
 
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
-    body = dict(payload)
+    body = _to_safe(payload)
+    if not isinstance(body, dict):
+        raise CheckpointError("checkpoint payload must be a mapping")
     body["format_version"] = _FORMAT_VERSION
     body["step"] = int(step)
 
@@ -152,22 +282,37 @@ def verify_checkpoint(path: str | Path) -> str:
 
 
 def load_checkpoint_payload(path: str | Path) -> dict[str, Any]:
-    """Verify the checkpoint's hash, then deserialize it.
+    """Verify the checkpoint's hash, then deserialize it with weights only.
 
     The hash check always runs first; ``torch.load`` is never reached for a
-    checkpoint whose file does not match its sidecar.
+    checkpoint whose file does not match its sidecar. The sidecar is unkeyed
+    (a hash is integrity, not authenticity), so ``weights_only=True`` is the
+    actual security boundary: a malicious pickle with a *valid* sidecar is
+    rejected before any reducer can execute, raising :class:`CheckpointError`.
     """
     import torch
 
     path = Path(path)
     verify_checkpoint(path)
     try:
-        payload = torch.load(path, map_location="cpu", weights_only=False)
+        payload = torch.load(path, map_location="cpu", weights_only=True)
+    except CheckpointError:
+        raise
     except Exception as exc:
-        raise CheckpointError(f"checkpoint {path} could not be deserialized: {exc}") from exc
+        raise CheckpointError(
+            f"checkpoint {path} could not be deserialized safely (weights_only=True): {exc}"
+        ) from exc
     if not isinstance(payload, dict):
         raise CheckpointError(f"checkpoint {path} did not contain a mapping payload")
-    return payload
+    version = payload.get("format_version")
+    if version != _FORMAT_VERSION:
+        raise CheckpointError(
+            f"checkpoint {path} has format_version {version!r}, expected "
+            f"{_FORMAT_VERSION}; refusing to load an incompatible or foreign checkpoint "
+            "(v1 checkpoints used unsafe pickle loading and are intentionally rejected)",
+            key="format_version",
+        )
+    return _from_safe(payload)
 
 
 def latest_checkpoint(directory: str | Path) -> Path | None:

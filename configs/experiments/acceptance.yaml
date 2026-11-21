@@ -17,14 +17,14 @@
 arm: acceptance
 title: 115.6k acceptance run (Stage B)
 question: does the default configuration pass the pre-registered acceptance criteria?
-init: bge-small
+init: scratch            # this architecture trains from scratch; a pretrained-trunk loader is not implemented
 variant: compact           # RAPPORT-C — 12 layers x 384 hidden, 33.46M (Y11-eligible)
 layers: 12
 hidden: 384
 readout: cosine
 weight_mode: learned       # floor 0.05, cap 4.0
 head_only: false
-ordering: curriculum
+ordering: fingerprint       # deterministic fingerprint order; the curriculum arm is not implemented
 mixture: full              # packaged preset, counts asserted within 1% of docs/dataset-strategy.md §6
 mixture_rows: 115600
 max_length: 512

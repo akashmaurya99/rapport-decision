@@ -13,6 +13,8 @@ import inspect
 import re
 from pathlib import Path
 
+import pytest
+
 CALIBRATION_DIR = Path(__file__).resolve().parents[3] / "src" / "calibration"
 
 _IMPORT_RE = re.compile(
@@ -73,5 +75,7 @@ def test_map_audit_flag_is_false(tmp_path):
     m = cal.fit_temperature_map(logits, labels, buckets, 2, groups)
     assert m.xstest_used_for_fitting is False
     payload = m.to_dict()
+    assert payload["xstest_used_for_fitting"] is False
     payload["xstest_used_for_fitting"] = True
-    assert cal.CalibrationMap.from_dict(payload).xstest_used_for_fitting is False
+    with pytest.raises(cal.CalibrationMapError):
+        cal.CalibrationMap.from_dict(payload)

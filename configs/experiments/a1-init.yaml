@@ -8,7 +8,7 @@
 arm: A1
 title: init
 question: does pretraining help at 55k?
-init: bge-small            # BAAI/bge-small-en-v1.5, 33.4M, MIT; trunk loaded, heads random
+init: scratch            # this architecture trains from scratch; a pretrained-trunk loader is not implemented
 init_alternates: [random, all-MiniLM-L6-v2]   # "MiniLM-L6" of docs/evaluation.md §5
 variant: compact           # ultra 6/320 | compact 12/384 (recommended) | large 16/448
 layers: 12
@@ -16,7 +16,7 @@ hidden: 384
 readout: cosine            # default readout until A2 evidence says otherwise
 weight_mode: learned       # Kendall-style s_t, floor 0.05, cap 4.0 (A4)
 head_only: false           # full fine-tune until A5 evidence says otherwise
-ordering: curriculum       # epochs 1-2 easy->hard, epochs 3+ uniform, hard oversampled 1.5x (A7)
+ordering: fingerprint       # deterministic fingerprint order; the curriculum arm is not implemented
 mixture: starter           # 55k — the arm question is explicitly "at 55k"
 mixture_rows: 55000
 seeds: [13, 29, 47]

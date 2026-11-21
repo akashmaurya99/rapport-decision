@@ -11,19 +11,24 @@ Assignment rule
   (stratified). Rows of one ``group_id`` are atomic: they land in one split.
 * The assignment is a pure function of ``(seed, group_id)``: groups are
   ordered by ``sha256("rapport:split:v1" || seed || group_id)`` and each
-  group is placed into the split with the largest row-count deficit against
-  its family's 70/15/15 target (water-filling). Ties prefer train, then dev,
-  then test. No RNG state, wall clock or platform artifact is consulted, so
-  the router is deterministic given ``(seed, inputs)`` on every machine.
+  group is placed into the split furthest *below* its target **relative to
+  that target's size** (proportional water-filling). Ties prefer train, then
+  dev, then test. Relative (not absolute) deficit prevents a small test
+  quota from being starved by a large train quota when groups are coarse.
+  No RNG state, wall clock or platform artifact is consulted, so the router
+  is deterministic given ``(seed, inputs)`` on every machine.
 
 Groups spanning families: a group is assigned once — in the first family
 (processed in sorted family order) that claims it — and every row of the
 group, in every family, follows that assignment. Stratification is then
 still exact per family up to group atomicity.
 
-After assignment, three leakage checks run unconditionally and are fatal:
-group disjointness, identical normalized option text of ≥40 tokens across
-splits, and exact 13-gram overlap across splits.
+After assignment, group disjointness and identical ≥40-token option text
+across splits are fatal. Rows contributing a cross-split exact 13-gram are
+instead moved to a *reported exclusion bucket*: they are omitted from the
+emitted splits and counted in the split manifest, and a hard assertion then
+verifies no overlap remains in the emitted rows. This keeps a fixed adapter
+directive from aborting a whole build while never hiding a residual leak.
 """
 
 from __future__ import annotations
@@ -40,6 +45,8 @@ from .fingerprint import membership_fingerprint
 from .leakage import (
     assert_no_group_overlap,
     assert_no_leakage,
+    assert_no_option_text_leak,
+    find_thirteen_gram_offender_ids,
 )
 from .manifest import (
     DEFAULT_DEDUP_THRESHOLD,
@@ -140,10 +147,24 @@ def _validate_threshold(value: object) -> float:
     return threshold
 
 
-def _targets(row_count: int) -> dict[str, int]:
+def _targets(row_count: int, group_count: int = 0) -> dict[str, int]:
+    """Row targets per split, with a floor so no split is structurally empty.
+
+    Rounding 70/15/15 can produce a zero target for dev or test on small
+    corpora, which would make that split unreachable (a family would have no
+    dev rows at all). When the family has enough atomic groups to fill every
+    split, each split keeps at least one row and train absorbs the remainder.
+    Large corpora are unaffected: their rounded targets already exceed one.
+    """
     train = int(row_count * RATIOS["train"] + 0.5)
     dev = int(row_count * RATIOS["dev"] + 0.5)
-    return {"train": train, "dev": dev, "test": row_count - train - dev}
+    test = row_count - train - dev
+    if group_count >= 2:
+        dev = max(dev, 1)
+    if group_count >= 3:
+        test = max(test, 1)
+    train = max(row_count - dev - test, 1)
+    return {"train": train, "dev": dev, "test": test}
 
 
 def split(
@@ -196,7 +217,7 @@ def split(
         counts = family_group_rows[family]
         if not counts:
             continue
-        targets = _targets(family_rows[family])
+        targets = _targets(family_rows[family], len(counts))
         current = {name: 0 for name in SPLIT_NAMES}
         ordered = sorted(
             counts.items(), key=lambda item: (_group_digest(seed, item[0]), item[0])
@@ -208,9 +229,16 @@ def split(
                 # OOD side): its rows in this family follow that assignment.
                 current[existing] += size
                 continue
+            # Relative deficit: how far below this split's own quota it is.
+            # Absolute deficits starve a small quota when groups are coarse.
             chosen = max(
                 SPLIT_NAMES,
-                key=lambda name: (targets[name] - current[name], _PRIORITY[name]),
+                key=lambda name: (
+                    (targets[name] - current[name]) / targets[name]
+                    if targets[name]
+                    else -1.0,
+                    _PRIORITY[name],
+                ),
             )
             assignment[group_id] = chosen
             current[chosen] += size
@@ -224,15 +252,30 @@ def split(
         for row in rows
     )
 
-    # Step 4 — fatal leakage verification on the final assignment.
+    # Step 4 — fatal checks plus the reported 13-gram exclusion bucket.
     overlap = assert_no_group_overlap(output)
-    assert_no_leakage(output)
+    # Option-text leakage is fatal on the full assignment (never quarantined):
+    # a 45-token identical option is an authored duplicate, not boilerplate.
+    assert_no_option_text_leak(output)
+    offenders = find_thirteen_gram_offender_ids(output)
+    emitted = (
+        tuple(row for row in output if row.example_id not in offenders)
+        if offenders
+        else output
+    )
+    # Hard assertion: nothing leaky may survive in the emitted splits, and a
+    # nonempty corpus may never silently become an empty "successful" build.
+    assert_no_leakage(emitted)
+    if rows and not emitted:
+        raise SplitInputError(
+            f"13-gram quarantine removed all {len(rows)} rows; no trainable corpus remains"
+        )
 
-    # Step 5 — counts, fingerprint, manifest.
+    # Step 5 — counts, fingerprint, manifest (of the emitted rows only).
     counts_out: dict[str, dict[str, int]] = {}
     totals = {name: 0 for name in SPLIT_NAMES}
     ood_rows = 0
-    for example in output:
+    for example in emitted:
         family_counts = counts_out.setdefault(
             example.task_family, {name: 0 for name in SPLIT_NAMES}
         )
@@ -241,7 +284,7 @@ def split(
         if example.source == ood_source:
             ood_rows += 1
     fingerprint = membership_fingerprint(
-        (example.example_id, example.split) for example in output
+        (example.example_id, example.split) for example in emitted
     )
     manifest = SplitManifest(
         fingerprint=fingerprint,
@@ -254,5 +297,7 @@ def split(
         totals=totals,
         ood_rows=ood_rows,
         ratios=ratios_dict(),
+        excluded_thirteen_gram_rows=len(offenders),
+        excluded_thirteen_gram_ids=tuple(sorted(offenders)),
     )
-    return SplitResult(examples=output, manifest=manifest)
+    return SplitResult(examples=emitted, manifest=manifest)

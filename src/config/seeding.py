@@ -27,8 +27,9 @@ def set_seed(seed: int, determinism: str = "strict") -> None:
         Non-negative integer below 2**32.
     determinism:
         ``strict`` enables deterministic torch algorithms and disables the
-        cudnn benchmark autotuner; ``relaxed`` seeds everything but allows
-        non-deterministic kernels.
+        cudnn benchmark autotuner; ``relaxed`` seeds everything and explicitly
+        restores deterministic algorithms, cudnn deterministic mode and the
+        cudnn autotuner, so switching modes in-process takes effect.
 
     Raises
     ------
@@ -63,12 +64,42 @@ def set_seed(seed: int, determinism: str = "strict") -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-        if determinism == "strict":
-            # Must be visible to cuBLAS before its handle is created; an
-            # operator-provided value wins over the default.
-            os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    configure_determinism(determinism)
 
-    if determinism == "strict":
-        torch.use_deterministic_algorithms(True)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+
+def configure_determinism(determinism: str = "strict") -> None:
+    """Apply process-level kernel settings without touching RNG streams.
+
+    Resume restores RNG state from a checkpoint, but deterministic-kernel flags
+    are process state and are not checkpointed. Keeping this separate prevents
+    a resumed run from either losing strict determinism or being re-seeded.
+    """
+    if determinism not in _VALID_DETERMINISM:
+        raise ConfigValueError(
+            f"determinism must be one of {sorted(_VALID_DETERMINISM)}, got {determinism!r}",
+            key="determinism",
+        )
+    try:
+        import torch
+    except ImportError as exc:
+        raise DependencyMissingError(f"torch is required to configure determinism: {exc}") from exc
+    if determinism == "strict" and torch.cuda.is_available():
+        # Must be visible to cuBLAS before its handle is created; an
+        # operator-provided value wins over the default.
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    strict = determinism == "strict"
+    if strict:
+        # MPS has no deterministic index_put_ kernel; requiring it raises
+        # RuntimeError mid-backward instead of degrading gracefully. Request
+        # determinism with warn_only there; CPU and CUDA keep the hard
+        # guarantee.
+        mps_only = (
+            hasattr(torch.backends, "mps")
+            and torch.backends.mps.is_available()
+            and not torch.cuda.is_available()
+        )
+        torch.use_deterministic_algorithms(True, warn_only=bool(mps_only))
+    else:
+        torch.use_deterministic_algorithms(False)
+    torch.backends.cudnn.deterministic = strict
+    torch.backends.cudnn.benchmark = not strict

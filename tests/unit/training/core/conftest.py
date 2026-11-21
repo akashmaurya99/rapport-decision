@@ -123,6 +123,41 @@ class StubRapportModel(torch.nn.Module):
         )
 
 
+class NanGrad(torch.autograd.Function):
+    """Forward returns zeros (finite); backward injects NaN gradients."""
+
+    @staticmethod
+    def forward(ctx, x):  # type: ignore[override]
+        return x * 0.0
+
+    @staticmethod
+    def backward(ctx, grad_out):  # type: ignore[override]
+        return torch.full_like(grad_out, float("nan"))
+
+
+class NanGradModel(torch.nn.Module):
+    """Produces finite outputs but NaN gradients (global-norm skip test double)."""
+
+    def __init__(self, batch: int = BATCH, options: int = N_OPTIONS) -> None:
+        super().__init__()
+        self.dummy = torch.nn.Parameter(torch.zeros(batch, options))
+        self.batch = batch
+        self.options = options
+
+    def forward(self, **kwargs):  # noqa: ARG002
+        logits = NanGrad.apply(self.dummy) + 1.0
+        batch, options = logits.shape
+        return RapportOutput(
+            choice_logits=logits,
+            scores=torch.full((batch, options), 0.5),
+            probability=torch.full((batch, 1), 0.5),
+            confidence=torch.full((batch, 1), 0.5),
+            answerable=torch.full((batch, 1), 0.5),
+            risk=torch.full((batch, 8), 0.5),
+            score_vector=logits,
+        )
+
+
 class NanLogitModel(torch.nn.Module):
     """Produces NaN choice logits so ``compute_losses`` raises LossNotFiniteError."""
 

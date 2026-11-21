@@ -548,6 +548,99 @@ class TestFailureModes:
         assert excinfo.value.row_index == 0
         assert excinfo.value.source == "src"
 
+    def test_adapted_shards_round_trip_through_read_parquet(self, tmp_path, fixed_now):
+        """Acquire → unified DecisionExample shards → read_parquet (no network)."""
+        from src.data.adapters.risk import RiskAdapter
+        from src.data.core.parquet import read_parquet
+        from src.data.core.schema import DecisionExample
+
+        def downloader(source, *, split=None):
+            for index in range(4):
+                yield {
+                    "prompt": f"Describe the safety review for case {index}.",
+                    "categories": ["violence"] if index % 2 else [],
+                    "id": f"risk-{index}",
+                }
+
+        manifest = acquire_source(
+            "risk-src",
+            output_dir=tmp_path,
+            licenses={"risk-src": "CC-BY-4.0"},
+            downloader=downloader,
+            now=fixed_now,
+            rows_per_shard=2,
+            adapter=RiskAdapter(seed=3),
+        )
+        assert manifest.status == "admitted"
+        assert manifest.observed_rows == 4
+
+        loaded: list[DecisionExample] = []
+        for shard in manifest.shards:
+            loaded.extend(read_parquet(shard))
+        assert len(loaded) == 4
+        assert all(isinstance(example, DecisionExample) for example in loaded)
+        assert {example.task_family for example in loaded} == {"risk"}
+        assert {example.source for example in loaded} == {
+            "nvidia/Aegis-AI-Content-Safety-Dataset-2.0"
+        }
+
+    def test_adapter_rejections_are_recorded_in_the_manifest(self, tmp_path, fixed_now):
+        """Rejected rows are never silently dropped: they are counted and kept."""
+        from src.data.adapters.risk import RiskAdapter
+
+        def downloader(source, *, split=None):
+            yield {
+                "prompt": "A risky prompt for case zero.",
+                "categories": ["violence"],
+                "id": "r-0",
+            }
+            yield {"prompt": "", "categories": ["violence"], "id": "r-1"}  # invalid: empty prompt
+
+        manifest = acquire_source(
+            "risk-src",
+            output_dir=tmp_path,
+            licenses={"risk-src": "CC-BY-4.0"},
+            downloader=downloader,
+            now=fixed_now,
+            adapter=RiskAdapter(seed=3),
+        )
+        assert manifest.raw_input_rows == 2
+        assert manifest.observed_rows == 1
+        assert manifest.rejected_rows == 1
+        rejected = manifest.adapter_report["rejected_records"]
+        assert len(rejected) == 1
+        assert rejected[0]["reason"]
+        assert manifest.adapter == "RiskAdapter"
+        assert manifest.shard_layout == "decision-example"
+
+    def test_existing_raw_acquisition_refuses_an_adapter_change(self, tmp_path, fixed_now):
+        """Reusing a raw corpus with an adapter must fail loudly (refresh=True)."""
+        from src.data.adapters.risk import RiskAdapter
+
+        def downloader(source, *, split=None):
+            yield {
+                "prompt": "A risky prompt for case zero.",
+                "categories": ["violence"],
+                "id": "r-0",
+            }
+
+        acquire_source(
+            "risk-src",
+            output_dir=tmp_path,
+            licenses={"risk-src": "CC-BY-4.0"},
+            downloader=downloader,
+            now=fixed_now,
+        )
+        with pytest.raises(AcquireError, match="refresh=True"):
+            acquire_source(
+                "risk-src",
+                output_dir=tmp_path,
+                licenses={"risk-src": "CC-BY-4.0"},
+                downloader=downloader,
+                now=fixed_now,
+                adapter=RiskAdapter(seed=3),
+            )
+
     def test_invalid_arguments(self, tmp_path, stub_downloader, rows):
         with pytest.raises(AcquireError):
             acquire_source(

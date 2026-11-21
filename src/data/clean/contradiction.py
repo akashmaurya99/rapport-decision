@@ -1,12 +1,13 @@
-"""Contradiction audit: groups with more than one gold label are quarantined.
+"""Contradiction audit: groups with more than one label payload are quarantined.
 
 Grouping key: ``(task_family, goal, state, sorted option texts)`` — exactly
 the content identity TASK-03 hashes, minus the label. Within a group, every
-non-``None`` gold ``chosen_index`` must agree. If two rows disagree, the
-*entire group* — every row, including rows with no ``chosen_index`` — is
-moved to the ``contested`` output list. No label is ever picked: there is no
-branch in this module that selects, averages, or "majority-votes" a gold
-index, because silently resolving a contradiction is how a benchmark gets
+row's full :func:`~src.data.clean.dedup.label_signature` (gold option text,
+scores, answerability and risk labels) must agree. If two rows disagree, the
+*entire group* — every row, including rows with an unset gold — is moved to
+the ``contested`` output list. No label is ever picked: there is no branch
+in this module that selects, averages, or "majority-votes" an annotation,
+because silently resolving a contradiction is how a benchmark gets
 poisoned.
 
 Quarantined rows are excluded from the clean output and reported: the count
@@ -26,6 +27,7 @@ from typing import Sequence
 from src.data.core.schema import DecisionExample
 from src.data.core.serialize import to_dict
 
+from .dedup import label_signature
 from .errors import ContestedWriteError
 
 
@@ -76,7 +78,7 @@ def write_contested(contested: Sequence[DecisionExample], path: str | Path) -> i
 
 
 class ContradictionAudit:
-    """Quarantine groups whose gold ``chosen_index`` differs across rows."""
+    """Quarantine groups whose full label payload differs across rows."""
 
     def run(
         self,
@@ -98,9 +100,7 @@ class ContradictionAudit:
         contested_groups = 0
         for key in order:
             rows = groups[key]
-            golds = {
-                row.chosen_index for row in rows if row.chosen_index is not None
-            }
+            golds = {label_signature(row) for row in rows}
             if len(golds) > 1:
                 contested.extend(rows)
                 contested_groups += 1

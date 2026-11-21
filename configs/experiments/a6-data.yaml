@@ -13,14 +13,14 @@
 arm: A6
 title: data
 question: payoff per example
-init: bge-small
+init: scratch            # this architecture trains from scratch; a pretrained-trunk loader is not implemented
 variant: compact           # ultra 6/320 | compact 12/384 (recommended) | large 16/448
 layers: 12
 hidden: 384
 readout: cosine
 weight_mode: learned
 head_only: false
-ordering: curriculum
+ordering: fingerprint       # deterministic fingerprint order; the curriculum arm is not implemented
 mixture: full              # default arm; alternatives below
 mixture_rows: 115600
 kd: false                  # true only for the 115.6k+KD arm, and only after the T15 gate passes

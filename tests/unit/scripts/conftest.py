@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -22,6 +23,7 @@ def run_e2e(
     *extra: str,
     config: Path = ACCEPTANCE,
     timeout: int = 300,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Invoke the CLI in a fresh process; returns the completed process."""
     command = [
@@ -34,6 +36,8 @@ def run_e2e(
         str(runs_dir),
         *extra,
     ]
+    environment = dict(os.environ)
+    environment.update(env or {})
     return subprocess.run(
         command,
         cwd=str(REPO_ROOT),
@@ -41,6 +45,7 @@ def run_e2e(
         text=True,
         timeout=timeout,
         check=False,
+        env=environment,
     )
 
 

@@ -45,6 +45,28 @@ def test_q1_rejects_option_with_fewer_than_three_tokens(example_factory):
     assert result.kept == ()
 
 
+@pytest.mark.parametrize(
+    ("family", "options"),
+    [
+        ("scoring", ("helpfulness", "correctness", "coherence")),
+        ("probability", ("Yes", "No")),
+        ("abstention", ("Answerable", "Unanswerable")),
+        ("risk", ("safe", "unsafe")),
+    ],
+)
+def test_q1_exempts_adapter_fixed_option_vocabularies(example_factory, family, options):
+    example = example_factory(family=family, options=options, chosen_index=None)
+    assert not q1_short_option(example)
+    assert QualityFilter().run([example]).kept == (example,)
+
+
+def test_q1_still_rejects_a_short_non_vocabulary_option(example_factory):
+    example = example_factory(
+        family="probability", options=("Yes", "unexpected"), chosen_index=None
+    )
+    assert q1_short_option(example)
+
+
 def test_q2_rejects_entity_residue(example_factory):
     # Normalization decodes &amp; once; residue that survives (e.g. from
     # double-encoded entities) is caught on the raw text by Q2.

@@ -29,6 +29,8 @@ from typing import Any, Mapping
 from .errors import TrainerConfigError
 
 _DEVICE_DOMAIN = ("auto", "cpu", "cuda", "mps")
+_DETERMINISM_DOMAIN = ("strict", "relaxed")
+_WEIGHT_MODE_DOMAIN = ("learned", "fixed", "uniform")
 
 # Fields whose values must be JSON/YAML-friendly scalars; used by to_dict().
 @dataclass(frozen=True)
@@ -45,6 +47,7 @@ class TrainingConfig:
 
     # Optimizer (training-strategy.md §3.1).
     learning_rate: float = 3.0e-4
+    head_lr: float | None = None  # heads/readout; None reuses learning_rate
     min_learning_rate: float = 1.0e-5
     weight_decay: float = 0.01
     beta1: float = 0.9
@@ -63,13 +66,36 @@ class TrainingConfig:
     # Checkpointing (training-strategy.md §8).
     checkpoint_every: int = 500
     checkpoint_dir: str = "checkpoints"
+    keep_last_n: int | None = None  # prune old checkpoint_step*.pt; None = keep all
 
     # E5/FR-TRAIN-04: more than this many non-finite steps in one epoch is
     # divergence, not bad luck.
     nonfinite_per_epoch: int = 10
 
+    # Determinism (FR-CONFIG-03): applied once by Trainer.fit() via
+    # src.config.seeding.set_seed(seed, determinism).
+    determinism: str = "strict"
+
+    # Ablation A4 / TASK-14: which multi-task weighting arm to run. "fixed"
+    # reproduces the §3.2 default weights and is the backward-compatible
+    # default; "uniform" gives every task weight 1.0; "learned" trains log_s.
+    weight_mode: str = "fixed"
+
     def to_dict(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
+
+    def resume_dict(self) -> dict[str, Any]:
+        """Trajectory-defining settings used for checkpoint compatibility.
+
+        Output location and retention/cadence are operational settings, not
+        mathematical training state. Excluding them permits relocating a run
+        without weakening checks on optimizer, precision, horizon or weighting.
+        """
+        return {
+            key: value
+            for key, value in self.to_dict().items()
+            if key not in {"checkpoint_dir", "checkpoint_every", "keep_last_n"}
+        }
 
     @classmethod
     def from_mapping(cls, mapping: Mapping[str, Any]) -> "TrainingConfig":
@@ -132,6 +158,11 @@ def _validate(config: TrainingConfig) -> None:
         fail("learning_rate", f"expected a finite float, got {config.learning_rate!r}")
     if config.learning_rate <= 0:
         fail("learning_rate", f"expected > 0, got {config.learning_rate!r}")
+    if config.head_lr is not None:
+        if not is_float(config.head_lr) or not math.isfinite(config.head_lr):
+            fail("head_lr", f"expected a finite float or None, got {config.head_lr!r}")
+        if config.head_lr <= 0:
+            fail("head_lr", f"expected > 0, got {config.head_lr!r}")
     if not is_float(config.min_learning_rate) or not math.isfinite(config.min_learning_rate):
         fail("min_learning_rate", f"expected a finite float, got {config.min_learning_rate!r}")
     if config.min_learning_rate <= 0:
@@ -175,5 +206,14 @@ def _validate(config: TrainingConfig) -> None:
         fail("checkpoint_every", f"expected an integer >= 1, got {config.checkpoint_every!r}")
     if not isinstance(config.checkpoint_dir, str) or not config.checkpoint_dir.strip():
         fail("checkpoint_dir", f"expected a non-empty string, got {config.checkpoint_dir!r}")
+    if config.keep_last_n is not None:
+        if not is_int(config.keep_last_n) or config.keep_last_n < 1:
+            fail("keep_last_n", f"expected an integer >= 1 or None, got {config.keep_last_n!r}")
     if not is_int(config.nonfinite_per_epoch) or config.nonfinite_per_epoch < 1:
         fail("nonfinite_per_epoch", f"expected an integer >= 1, got {config.nonfinite_per_epoch!r}")
+    if not isinstance(config.determinism, str) or config.determinism not in _DETERMINISM_DOMAIN:
+        fail("determinism", f"expected one of {list(_DETERMINISM_DOMAIN)}, "
+                            f"got {config.determinism!r}")
+    if not isinstance(config.weight_mode, str) or config.weight_mode not in _WEIGHT_MODE_DOMAIN:
+        fail("weight_mode", f"expected one of {list(_WEIGHT_MODE_DOMAIN)}, "
+                            f"got {config.weight_mode!r}")

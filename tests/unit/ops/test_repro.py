@@ -153,6 +153,35 @@ def test_verify_resume_default_is_50_steps_and_tolerance() -> None:
     assert result.tolerance == pytest.approx(1e-4)
 
 
+def test_verify_resume_trajectories_returns_bool() -> None:
+    baseline = [1.0, 0.5, 0.25]
+    same = [1.0 + 5e-5, 0.5 - 5e-5, 0.25]
+    assert verify_resume(baseline, same) is True
+    assert verify_resume(baseline, [1.0, 0.5, 0.25 + 2e-4]) is False
+    assert verify_resume(baseline, [1.0, 0.5]) is False  # length mismatch
+
+
+def test_verify_resume_trajectories_accepts_numpy_arrays_and_keywords() -> None:
+    import numpy as np
+
+    values = np.array([0.9, 0.4, 0.1], dtype=np.float64)
+    assert verify_resume(values, values.copy(), tolerance=1e-6) is True
+    assert verify_resume(trajectory_a=[1.0], trajectory_b=[1.0]) is True
+
+
+def test_verify_resume_trajectories_validates_inputs() -> None:
+    with pytest.raises(ReproductionError):
+        verify_resume([1.0], [1.0], tolerance=0.0)
+    with pytest.raises(ReproductionError):
+        verify_resume([1.0], [1.0], tolerance=float("nan"))
+    with pytest.raises(ReproductionError):
+        verify_resume("not-a-sequence", [1.0])
+    with pytest.raises(ReproductionError):
+        verify_resume([1.0, None], [1.0, 1.0])  # type: ignore[list-item]
+    with pytest.raises(ReproductionError):
+        verify_resume([1.0], [1.0], seed=13)  # mixed calling conventions
+
+
 def test_result_to_dict_round_trip() -> None:
     recorded = run_reference_workload(SEED, STEPS)
     result = verify_resume(seed=SEED, recorded_loss=recorded)

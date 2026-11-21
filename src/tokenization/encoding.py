@@ -26,13 +26,16 @@ state alone cannot absorb the overflow:
 Every truncation sets ``truncated=True`` on the returned record — the input
 :class:`~src.data.core.schema.DecisionExample` is frozen and is **never**
 mutated; a new :class:`EncodedExample` is returned instead. Truncations are
-also counted **per source** in a module-level counter. ``truncation_counts()``
-returns a copy, ``reset_truncation_counts()`` clears it (tests use this for
-isolation), and when ``encode_example`` is given a ``manifest`` mapping the
-counter snapshot is written into it under ``manifest["truncations_per_source"]``
-together with ``manifest["truncation_policy"]``. The run-manifest writer lives
-in ``src/config/manifest.py`` (TASK-01), which this task does not own; the
-caller merges these keys, or passes the ``manifest`` mapping through.
+also counted **per source**. The counter is *caller-owned*: when
+``encode_example``/``bucket_examples`` is given a ``manifest`` mapping, the
+count is kept in ``manifest["truncations_per_source"]`` and no process-global
+state is touched — separate callers/manifests cannot leak counts into one
+another. Only the legacy no-manifest path uses the module-level
+:data:`TRUNCATION_COUNTS`; ``truncation_counts()`` returns a copy of it and
+``reset_truncation_counts()`` clears it for tests that rely on that path.
+``manifest["truncation_policy"]`` records the policy verbatim. The run-manifest
+writer lives in ``src/config/manifest.py`` (TASK-01), which this task does not
+own; the caller merges these keys, or passes the ``manifest`` mapping through.
 
 Length bucketing (FR-TOK-02)
 ----------------------------
@@ -51,7 +54,7 @@ long, and the last (partial) batch of a bucket may be smaller than
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterable, MutableMapping, Sequence
+from typing import Any, Iterable, Mapping, MutableMapping, Sequence
 
 from src.data.core.schema import DecisionExample, Option
 
@@ -77,8 +80,19 @@ TRUNCATION_POLICY = (
 TRUNCATION_MANIFEST_KEY = "truncations_per_source"
 TRUNCATION_POLICY_MANIFEST_KEY = "truncation_policy"
 
-# Module-level per-source truncation counter; surfaced through the manifest.
+# Legacy fallback counter, used ONLY when no caller-owned manifest is passed.
+# New code should pass a manifest mapping to keep counts scoped to its run.
 TRUNCATION_COUNTS: dict[str, int] = {}
+
+
+def _manifest_counts(manifest: Mapping[str, Any] | None) -> dict[str, int]:
+    """Read a caller-owned count snapshot; never touches global state."""
+    if manifest is None:
+        return {}
+    current = manifest.get(TRUNCATION_MANIFEST_KEY)
+    if isinstance(current, Mapping):
+        return {str(key): int(value) for key, value in current.items()}
+    return {}
 
 
 def truncation_counts() -> dict[str, int]:
@@ -118,9 +132,10 @@ def encode_example(
     Truncates the state from the end when the sequence overflows; sets
     ``truncated`` on the returned copy (the input example is untouched) and
     increments the per-source truncation counter for ``example.source``. If
-    ``manifest`` is a mutable mapping, it is updated in place with
-    ``truncations_per_source`` (a snapshot of the counter) and
-    ``truncation_policy``.
+    ``manifest`` is a mutable mapping, that mapping is the counter owner: it
+    is updated in place with ``truncations_per_source`` and
+    ``truncation_policy``; the module-level counter is left untouched. With
+    no manifest the legacy module-level counter is used.
     """
     if not isinstance(budget, int) or isinstance(budget, bool) or budget < 1:
         raise BudgetTooSmallError("budget must be a positive integer", field="budget")
@@ -158,9 +173,13 @@ def encode_example(
         ids = ids[:budget]
 
     if truncated:
-        TRUNCATION_COUNTS[example.source] = TRUNCATION_COUNTS.get(example.source, 0) + 1
+        if manifest is None:
+            TRUNCATION_COUNTS[example.source] = TRUNCATION_COUNTS.get(example.source, 0) + 1
+        else:
+            counts = _manifest_counts(manifest)
+            counts[example.source] = counts.get(example.source, 0) + 1
+            manifest[TRUNCATION_MANIFEST_KEY] = counts
         if manifest is not None:
-            manifest[TRUNCATION_MANIFEST_KEY] = truncation_counts()
             manifest[TRUNCATION_POLICY_MANIFEST_KEY] = TRUNCATION_POLICY
     elif manifest is not None:
         manifest.setdefault(TRUNCATION_POLICY_MANIFEST_KEY, TRUNCATION_POLICY)
@@ -208,6 +227,7 @@ def bucket_examples(
     batch_size: int = 32,
     bucket_widths: Sequence[int] | None = None,
     tokenizer: RapportTokenizer | None = None,
+    manifest: MutableMapping[str, Any] | None = None,
 ) -> list[BucketedBatch]:
     """Bucket ``examples`` into at most three padded batch shapes.
 
@@ -216,7 +236,9 @@ def bucket_examples(
     records (used as-is, no counter side effects). Input order is preserved
     within each bucket; buckets are emitted short → medium → long; each
     example is padded with ``[PAD]`` to its bucket width and its
-    ``attention_mask`` is 0 beyond the real token length.
+    ``attention_mask`` is 0 beyond the real token length. ``manifest``, when
+    given, is passed to :func:`encode_example` as the caller-owned truncation
+    counter (no global state is touched).
 
     Raises :class:`BucketOverflowError` if an encoded example is longer than
     the largest bucket width.
@@ -235,12 +257,21 @@ def bucket_examples(
     if any(not isinstance(w, int) or isinstance(w, bool) or w < 1 for w in widths):
         raise BudgetTooSmallError("bucket_widths must be positive integers", field="bucket_widths")
 
+    if manifest is not None:
+        # A zero-truncation run still records an explicit, isolated count map.
+        manifest.setdefault(TRUNCATION_MANIFEST_KEY, _manifest_counts(manifest))
     encoded: list[EncodedExample] = []
     for item in examples:
         if isinstance(item, EncodedExample):
             encoded.append(item)
+            if item.truncated and manifest is not None:
+                counts = _manifest_counts(manifest)
+                counts[item.source] = counts.get(item.source, 0) + 1
+                manifest[TRUNCATION_MANIFEST_KEY] = counts
         else:
-            encoded.append(encode_example(item, budget=budget, tokenizer=tokenizer))
+            encoded.append(
+                encode_example(item, budget=budget, manifest=manifest, tokenizer=tokenizer)
+            )
 
     max_width = widths[-1]
     groups: list[list[EncodedExample]] = [[] for _ in widths]

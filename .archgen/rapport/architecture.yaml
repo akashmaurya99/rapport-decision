@@ -14,6 +14,7 @@ toolchain:
   test: "pytest -q"
   lint: "ruff check ."
   typecheck: "mypy src"
+  dependency_lock: "requirements.lock — exact pins; install with `pip install -c requirements.lock -e .[dev]`; CI verifies an outside-checkout `src.*` import smoke test"
   source_root: "src"
   test_root: "tests/unit"
 
@@ -27,13 +28,13 @@ structure:
   - path: "README.md"
     purpose: "the only repository-level orientation document; points at .archgen/rapport"
   - path: ".github/workflows/ci.yml"
-    purpose: "lint, typecheck and unit tests on push"
+    purpose: "lint, typecheck, unit tests, pinned-lock install, outside-checkout import smoke test and advisory dependency audit on push and pull_request"
   - path: "src/__init__.py"
     purpose: "package marker and version"
   - path: "src/config/**"
     purpose: "config resolution, validation and run manifests"
   - path: "configs/base.yaml"
-    purpose: "the base run config every experiment extends"
+    purpose: "authoritative defaults for the shared (ResolvedConfig) fields; merged first by load_experiment_config, and read directly by legacy load_config. Mirrored by src/config/schema.py::BASE_DEFAULTS for installed distributions (LR 3e-4 matches the experiment YAMLs `lr`)"
   - path: "configs/experiments/**"
     purpose: "one declarative config per experiment and ablation arm"
   - path: "src/data/core/**"
@@ -98,8 +99,9 @@ modules:
     owns: ["src/config/**", "tests/unit/config/**", "configs/base.yaml"]
     depends_on_modules: []
     key_interfaces:
-      - "load_config (src/config/loader.py)"
-      - "RunManifest (src/config/manifest.py)"
+      - "load_config (src/config/loader.py) — legacy flat base YAML"
+      - "load_experiment_config / ExperimentConfig.to_resolved (src/config/loader.py) — validated experiment boundary"
+      - "validate_run_id / build_run_manifest / write_run_manifest (src/config/manifest.py)"
 
   - name: "data"
     responsibility: "turn licensed sources into validated, deduplicated, split, mixture-sampled DecisionExample rows"
@@ -108,8 +110,8 @@ modules:
     key_interfaces:
       - "DecisionExample (src/data/core/schema.py)"
       - "normalize_example (src/data/core/normalize.py)"
-      - "build_split_manifest (src/data/splits/split.py)"
-      - "sample_mixture (src/data/mixture/sampler.py)"
+      - "split / SplitManifest (src/data/splits/router.py, src/data/splits/manifest.py)"
+      - "sample_mixture (src/data/mixture/mixture.py)"
 
   - name: "tokenization"
     responsibility: "special tokens, encoding and length bucketing"
@@ -117,15 +119,15 @@ modules:
     depends_on_modules: ["config", "data"]
     key_interfaces:
       - "build_tokenizer (src/tokenization/tokenizer.py)"
-      - "encode_example (src/tokenization/encode.py)"
+      - "encode_example (src/tokenization/encoding.py)"
 
   - name: "model"
     responsibility: "encoder trunk, marker readout, six heads and parameter accounting"
     owns: ["src/model/core/**", "src/model/head/**", "tests/unit/model/core/**", "tests/unit/model/head/**"]
     depends_on_modules: ["config", "tokenization"]
     key_interfaces:
-      - "RapportConfig (src/model/core/spec.py)"
-      - "count_parameters (src/model/core/spec.py)"
+      - "RapportConfig (src/model/core/config.py)"
+      - "count_parameters (src/model/core/counting.py)"
       - "RapportModel (src/model/head/model.py)"
 
   - name: "training"
@@ -179,6 +181,7 @@ modules:
     key_interfaces:
       - "JsonlLogger (src/ops/logging.py)"
       - "RunRegistry (src/ops/registry.py)"
+      - "verify_resume(trajectory_a, trajectory_b, tolerance=1e-4) -> bool (src/ops/repro.py)"
 
 data_contracts:
   "Option":
@@ -194,35 +197,50 @@ data_contracts:
       - { field: "task_family", type: "str", required: true, notes: "one of choice, preference, scoring, probability, abstention, risk" }
       - { field: "goal", type: "str", required: true, notes: "the decision to make, in one sentence" }
       - { field: "state", type: "str", required: true, notes: "context the decision depends on; may be empty only for pure preference" }
-      - { field: "options", type: "list[Option]", required: true, notes: "2 to 8 elements in the default path" }
-      - { field: "chosen_index", type: "int", required: false, notes: "0-based; required for choice and preference families" }
-      - { field: "scores", type: "list[float]", required: false, notes: "normalized utility in 0..1 per option; length equals options" }
-      - { field: "answerable", type: "bool", required: false, notes: "false when the correct behaviour is to abstain" }
-      - { field: "risk_labels", type: "list[str]", required: false, notes: "subset of the eight declared risk categories" }
+      - { field: "options", type: "tuple[Option, ...]", required: true, notes: "2 to 8 elements in the default path; immutable/hashable tuple at runtime" }
+      - { field: "chosen_index", type: "int | None", required: false, notes: "0-based; required for choice and preference families; null when abstaining/no choice" }
+      - { field: "scores", type: "tuple[float, ...] | None", required: false, notes: "normalized utility in 0..1 per option; length equals options" }
+      - { field: "answerable", type: "bool | None", required: false, notes: "false when the correct behaviour is to abstain" }
+      - { field: "risk_labels", type: "tuple[str, ...] | None", required: false, notes: "subset of the eight declared risk categories" }
       - { field: "source", type: "str", required: true, notes: "dataset identifier used by the provenance manifest" }
       - { field: "license", type: "str", required: true, notes: "SPDX identifier copied from the acquisition manifest" }
       - { field: "group_id", type: "str", required: true, notes: "prompt or document id; never crosses splits" }
       - { field: "split", type: "str", required: true, notes: "train, dev or test" }
 
   "RunManifest":
-    storage: "JSON at runs/<run_id>/manifest.json"
+    storage: "JSON at runs/<run_id>/manifest.json (atomic temp -> fsync -> os.replace)"
     fields:
-      - { field: "run_id", type: "str", required: true, notes: "timestamp plus config hash prefix" }
-      - { field: "git_sha", type: "str", required: true, notes: "dirty tree is recorded as a boolean too" }
+      - { field: "run_id", type: "str", required: true, notes: "portable single path component: timestamp + config hash prefix + pid + nonce; validated against traversal by validate_run_id" }
+      - { field: "git_sha", type: "str", required: true, notes: "resolved relative to REPO_ROOT (not CWD); dirty tree is recorded as git_dirty" }
+      - { field: "git_dirty", type: "bool | None", required: false, notes: "null when git is unavailable" }
       - { field: "config_hash", type: "str", required: true, notes: "sha256 of the resolved config" }
-      - { field: "data_fingerprint", type: "str", required: true, notes: "sha256 of the split manifest" }
+      - { field: "data_fingerprint", type: "str", required: true, notes: "sha256 of the split manifest; empty placeholder before acquisition" }
       - { field: "seed", type: "int", required: true, notes: "the seed used for python, numpy and torch" }
       - { field: "device", type: "str", required: true, notes: "cuda device name plus compute capability" }
+      - { field: "compute_capability", type: "str | None", required: false, notes: "e.g. 7.5; null off CUDA" }
+      - { field: "determinism", type: "str", required: false, notes: "strict or relaxed" }
       - { field: "versions", type: "dict", required: true, notes: "python, torch, transformers, datasets, onnxruntime" }
+      - { field: "dependency_lock_sha256", type: "str | null", required: false, notes: "sha256 of requirements.lock at build time" }
 
   "TeacherLabel":
-    storage: "content-addressed float16 array plus JSON index under cache/teacher/<teacher_id>/"
+    storage: "content-addressed array plus JSON index under cache/teacher/<teacher_id>/ (src/distill/cache.py)"
     fields:
+      # SoftLabelEntry (one cached example). teacher_id/template_hash/cache_dir
+      # are properties of the index, not of the per-example entry.
       - { field: "example_id", type: "str", required: true, notes: "joins to DecisionExample" }
-      - { field: "option_logprobs", type: "list[float]", required: true, notes: "length equals option count" }
+      - { field: "option_count", type: "int", required: true, notes: "length of logprobs" }
+      - { field: "logprobs", type: "tuple[float, ...]", required: true, notes: "teacher distribution, one entry per option (formerly option_logprobs)" }
+      - { field: "entropy", type: "float", required: true, notes: "entropy of the distribution; drives the exclusion gate" }
+      - { field: "exclude_from_distillation", type: "bool", required: true, notes: "low-information examples are dropped" }
+      - { field: "cache_hit", type: "bool", required: true, notes: "served from disk" }
+      - { field: "recomputed", type: "bool", required: true, notes: "stale hash forced recomputation" }
+    index_fields:
+      # SoftLabelCacheResult — the index returned by build_soft_label_cache.
       - { field: "teacher_id", type: "str", required: true, notes: "model id plus revision plus quantization" }
       - { field: "template_hash", type: "str", required: true, notes: "hash of the exact prompt template" }
-      - { field: "cache_hash", type: "str", required: true, notes: "sha256 of the payload; a mismatch invalidates the entry" }
+      - { field: "cache_dir", type: "str", required: true }
+      - { field: "total / hits / misses / recomputed / teacher_forwards", type: "int", required: true, notes: "cache accounting; cache_hit_rate = hits/total" }
+      - { field: "labels", type: "mapping[str, SoftLabelEntry]", required: true }
 
   "CalibrationMap":
     storage: "JSON at runs/<run_id>/calibration.json"
@@ -242,27 +260,36 @@ data_contracts:
       - { field: "group_overlap", type: "int", required: true, notes: "must be zero or the build fails" }
       - { field: "dedup_threshold", type: "float", required: true, notes: "MinHash Jaccard threshold actually applied" }
       - { field: "ood_source", type: "str", required: true, notes: "the withheld source; must be named and must have zero rows in train and dev (default UltraFeedback-binarized)" }
+      - { field: "withheld_source", type: "str", required: true, notes: "explicit withholding identity (same as ood_source); never implicit (src/data/splits/manifest.py)" }
+      - { field: "seed / totals / ood_rows / ratios", type: "int / dict / int / dict", required: false, notes: "recorded audit values with defaults" }
+      - { field: "excluded_thirteen_gram_rows / excluded_thirteen_gram_ids", type: "int / tuple[str, ...]", required: false, notes: "optional cross-split 13-gram exclusion audit" }
 
   "EvalReport":
-    storage: "JSON plus markdown under runs/<run_id>/report.*"
+    storage: "JSON at ReportResult.report_json_path plus markdown at ReportResult.report_md_path under runs/<run_id>/report.* (src/evaluation/report.py)"
     fields:
       - { field: "run_id", type: "str", required: true, notes: "links to the manifest" }
-      - { field: "arms", type: "list[str]", required: true, notes: "every ablation arm, including failed arms" }
-      - { field: "metrics", type: "dict", required: true, notes: "per family, per split, mean and std over seeds" }
-      - { field: "verdicts", type: "dict", required: true, notes: "pass, fail or not-measured per acceptance criterion" }
+      - { field: "run_dir", type: "Path", required: true }
+      - { field: "report_json_path", type: "Path", required: true }
+      - { field: "report_md_path", type: "Path", required: true }
+      - { field: "exit_code", type: "int", required: true }
+      - { field: "arms", type: "tuple[ArmResult, ...]", required: true, notes: "every arm, including failed arms; arm/question/status/summary/metric/split, per_seed, mean/std/n_seeds, comparison, missing, notes" }
+      - { field: "verdicts", type: "tuple[VerdictRow, ...]", required: true, notes: "per criterion: id/criterion/threshold/status/blocking/detail/missing; status is pass, fail or not-measured" }
+      - { field: "negative_results", type: "tuple[str, ...]", required: true }
+      - { field: "fingerprint_consistent", type: "bool", required: true, notes: "false → every verdict degrades to not-measured" }
+      - { field: "metrics", type: "dict", required: true, notes: "nested per-family, per-split, per-metric mean/std payload inside report_json_path" }
 
 api_contracts:
   "inference":
     - endpoint: "Predictor.predict(request) -> DecisionResult"
       auth: "none; local library call"
       request_payload: { "goal": "str", "state": "str", "options": "list[str]", "task_family": "str" }
-      success: "DecisionResult with chosen_index int, scores list[float], probabilities list[float], confidence float, abstain bool, risk list[float], temperature float"
+      success: "DecisionResult with chosen_index int | None (null exactly when abstain is true), scores tuple[float, ...], probabilities tuple[float, ...], confidence float, abstain bool, risk tuple[float, ...], temperature float"
       error_shape: { code: "str", message: "str", retryable: "bool" }
   "training":
-    - endpoint: "Trainer.train(config) -> Checkpoint"
+    - endpoint: "Trainer.fit(dataloader, epochs=None) -> list[StepResult]; Trainer.save() -> checkpoint path"
       auth: "none"
-      request_payload: { "config": "ResolvedConfig" }
-      success: "Checkpoint path plus the manifest of the run"
+      request_payload: { "config": "TrainingConfig or mapping; model attached via Trainer.attach()" }
+      success: "Step history; atomic checkpoint_stepN.pt + .sha256 sidecar loaded with weights_only=True"
       error_shape: { code: "str", message: "str", retryable: "bool" }
   "calibration":
     - endpoint: "fit_temperature_map(logits, labels, buckets, folds) -> CalibrationMap"

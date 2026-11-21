@@ -19,6 +19,7 @@ from src.data.core.schema import DecisionExample
 from src.tokenization import (
     PAD_ID,
     PADDING_POLICY,
+    TRUNCATION_MANIFEST_KEY,
     TRUNCATION_POLICY,
     bucket_examples,
     encode_example,
@@ -153,6 +154,26 @@ def test_decision_examples_are_encoded_and_truncations_counted() -> None:
     short_example = make_example(state_words=2, source="fixture/count-short")
     bucket_examples([long_example, short_example])
     assert truncation_counts() == {"fixture/count-long": 1}
+
+
+def test_truncation_counts_are_isolated_per_caller_manifest() -> None:
+    reset_truncation_counts()
+    manifest_a: dict = {}
+    manifest_b: dict = {}
+
+    bucket_examples([make_example(state_words=260, source="fixture/iso-a")], manifest=manifest_a)
+    bucket_examples(
+        [
+            make_example(state_words=260, source="fixture/iso-b"),
+            make_example(state_words=260, source="fixture/iso-b"),
+        ],
+        manifest=manifest_b,
+    )
+
+    assert manifest_a[TRUNCATION_MANIFEST_KEY] == {"fixture/iso-a": 1}
+    assert manifest_b[TRUNCATION_MANIFEST_KEY] == {"fixture/iso-b": 2}
+    # The legacy global counter was never touched by either caller.
+    assert truncation_counts() == {}
 
 
 def test_more_than_three_bucket_widths_are_refused() -> None:

@@ -61,3 +61,15 @@ class InvalidTaskIdError(ModelError):
     """``task_ids`` is not a 1-D integer vector in range for the configured tasks."""
 
     code = "MODEL_INVALID_TASK_ID"
+
+
+class TaskMarkerError(ModelError):
+    """The ``<task>`` marker is missing, duplicated, left-padded or not first."""
+
+    code = "MODEL_TASK_MARKER_INVALID"
+
+
+class DeviceMismatchError(ModelError):
+    """An input tensor lives on a different device than ``input_ids``."""
+
+    code = "MODEL_DEVICE_MISMATCH"

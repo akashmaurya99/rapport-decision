@@ -44,9 +44,11 @@ follows the same loss trajectory as the uninterrupted one.
 
 from __future__ import annotations
 
+import copy
 import math
 import random
 from dataclasses import dataclass
+from itertools import islice
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -54,13 +56,16 @@ import numpy as np
 import torch
 from torch import nn
 
+from src.config.seeding import configure_determinism, set_seed
 from src.ops.logging import JsonlLogger
-from src.training.losses import LossNotFiniteError, compute_losses
+from src.training.losses import DEFAULT_WEIGHTS, LossNotFiniteError, compute_losses
+from src.training.multitask import DEFAULT_TASK_NAMES, TaskWeighter
 
 from .checkpoint import (
     latest_checkpoint,
     load_checkpoint_payload,
     save_checkpoint,
+    sidecar_path,
     step_from_filename,
 )
 from .config import TrainingConfig, _validate
@@ -96,6 +101,20 @@ _LOSS_KEYS = (
 _NO_DECAY_TOKENS = ("bias", "norm", "embedding", "task_vector", "ln_", "rmsnorm")
 
 
+def _is_head_param(name: str) -> bool:
+    """True for readout / head parameters, false for trunk (encoder) parameters.
+
+    The production model names them ``readout.*``, ``probability_head.*``,
+    ``confidence_head.*`` and ``risk_head.*``; generic ``head.*`` and
+    ``*.head.*`` layouts are accepted too.
+    """
+    lowered = name.lower()
+    if lowered.startswith("head") or lowered.startswith("readout"):
+        return True
+    parts = lowered.split(".")
+    return "head" in parts or any(part.endswith("_head") for part in parts)
+
+
 @dataclass(frozen=True)
 class StepResult:
     """Outcome of one consumed batch."""
@@ -108,25 +127,46 @@ class StepResult:
     sampler_offset: int
     nonfinite_steps: int
     grad_norm: float | None = None
+    active: Mapping[str, bool] | None = None
 
 
-def build_optimizer(model: nn.Module, config: TrainingConfig) -> torch.optim.AdamW:
-    """AdamW with weight decay excluded on norms, biases and embeddings (§3.1)."""
-    decay: list[nn.Parameter] = []
-    no_decay: list[nn.Parameter] = []
-    for name, param in model.named_parameters():
+def build_optimizer(
+    model: nn.Module,
+    config: TrainingConfig,
+    *,
+    weighter: TaskWeighter | None = None,
+) -> torch.optim.AdamW:
+    """AdamW with no decay on norms/biases/embeddings and an optional head LR.
+
+    Parameters are bucketed by ``(is_head, no_decay)``. Head/readout buckets
+    get ``config.head_lr`` when set (otherwise the encoder LR); norm/bias and
+    other no-decay parameters always get weight decay 0. A trainable
+    ``TaskWeighter.log_s`` (learned arm) joins the no-decay body group.
+    """
+    named: list[tuple[str, nn.Parameter]] = list(model.named_parameters())
+    if weighter is not None:
+        named.extend(
+            (f"weighter.{name}", param)
+            for name, param in weighter.named_parameters()
+            if param.requires_grad
+        )
+    buckets: dict[tuple[bool, bool], list[nn.Parameter]] = {}
+    for name, param in named:
         if not param.requires_grad:
             continue
         lowered = name.lower()
-        if param.ndim < 2 or any(token in lowered for token in _NO_DECAY_TOKENS):
-            no_decay.append(param)
-        else:
-            decay.append(param)
+        no_decay = param.ndim < 2 or any(token in lowered for token in _NO_DECAY_TOKENS)
+        buckets.setdefault((_is_head_param(name), no_decay), []).append(param)
     groups: list[dict[str, Any]] = []
-    if decay:
-        groups.append({"params": decay, "weight_decay": config.weight_decay})
-    if no_decay:
-        groups.append({"params": no_decay, "weight_decay": 0.0})
+    for (is_head, no_decay), params in buckets.items():
+        groups.append(
+            {
+                "params": params,
+                "lr": config.head_lr if (is_head and config.head_lr is not None)
+                else config.learning_rate,
+                "weight_decay": 0.0 if no_decay else config.weight_decay,
+            }
+        )
     return torch.optim.AdamW(
         groups,
         lr=config.learning_rate,
@@ -153,6 +193,27 @@ def build_scheduler(
         return min_ratio + (1.0 - min_ratio) * cosine
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
+def _build_weighter(config: TrainingConfig) -> TaskWeighter:
+    """Build the A4 weighting arm for this config.
+
+    * ``learned`` — ``log_s`` is trainable and starts at 0 (all weights 1.0);
+      ``TaskWeighter.forward`` adds the Kendall ``Σ s_t`` regulariser.
+    * ``fixed`` — ``log_s = -log(DEFAULT_WEIGHTS)`` is frozen, reproducing the
+      §3.2 default weighted sum exactly (backward-compatible default).
+    * ``uniform`` — ``log_s = 0`` is frozen, so every task has weight 1.0.
+    """
+    if config.weight_mode == "learned":
+        return TaskWeighter(num_tasks=len(DEFAULT_TASK_NAMES))
+    initial = (
+        [-math.log(DEFAULT_WEIGHTS[name]) for name in DEFAULT_TASK_NAMES]
+        if config.weight_mode == "fixed"
+        else [0.0] * len(DEFAULT_TASK_NAMES)
+    )
+    weighter = TaskWeighter(num_tasks=len(DEFAULT_TASK_NAMES), init_s=initial)
+    weighter.log_s.requires_grad_(False)
+    return weighter
 
 
 def _rng_state() -> dict[str, Any]:
@@ -183,14 +244,6 @@ def _restore_rng(state: Mapping[str, Any]) -> None:
     cuda_states = state.get("cuda") or []
     if cuda_states and torch.cuda.is_available():
         torch.cuda.set_rng_state_all(list(cuda_states))
-
-
-def _grads_finite(model: nn.Module) -> bool:
-    for param in model.parameters():
-        grad = param.grad
-        if grad is not None and not bool(torch.isfinite(grad).all()):
-            return False
-    return True
 
 
 class Trainer:
@@ -247,6 +300,7 @@ class Trainer:
         self.nonfinite_steps_epoch = 0
 
         self.model: nn.Module | None = None
+        self.weighter: TaskWeighter | None = None
         self.optimizer: torch.optim.Optimizer | None = None
         self.scheduler: torch.optim.lr_scheduler.LRScheduler | None = None
         self.scaler: torch.amp.GradScaler | None = None
@@ -265,7 +319,29 @@ class Trainer:
         """Attach ``model`` and build (or adopt) optimizer/scheduler/scaler."""
         self.model = model
         self.model.to(self.device)
-        self.optimizer = optimizer if optimizer is not None else build_optimizer(model, self.config)
+        self.weighter = _build_weighter(self.config)
+        self.weighter.to(self.device)
+        if optimizer is not None and self.weighter.log_s.requires_grad:
+            # A caller-supplied optimizer must own every trainable parameter.
+            # Silently omitting log_s both freezes learned weighting and leaves
+            # its gradients outside optimizer.zero_grad().
+            if not any(
+                parameter is self.weighter.log_s
+                for group in optimizer.param_groups
+                for parameter in group["params"]
+            ):
+                optimizer.add_param_group(
+                    {
+                        "params": [self.weighter.log_s],
+                        "lr": self.config.learning_rate,
+                        "weight_decay": 0.0,
+                    }
+                )
+        self.optimizer = (
+            optimizer
+            if optimizer is not None
+            else build_optimizer(model, self.config, weighter=self.weighter)
+        )
         self.scheduler = (
             scheduler if scheduler is not None else build_scheduler(self.optimizer, self.config)
         )
@@ -315,6 +391,23 @@ class Trainer:
                 epoch=self.epoch,
             )
 
+    def _weighted_total(self, breakdown: Any) -> torch.Tensor:
+        """Resolve the A4 arm's weighted total from the loss breakdown.
+
+        ``fixed`` keeps the exact §3.2 weighted sum; ``uniform`` uses the
+        weighter's equal-weight sum; ``learned`` uses the weighter's Kendall
+        objective (weighted sum plus the ``Σ s_t`` regulariser), whose ``s_t``
+        gradient flows to ``log_s`` in the optimizer's no-decay group.
+        """
+        if self.weighter is None:
+            return breakdown.total
+        if self.config.weight_mode == "fixed":
+            return breakdown.total
+        terms = {name: getattr(breakdown, name) for name in DEFAULT_TASK_NAMES}
+        if self.config.weight_mode == "learned":
+            return self.weighter(terms, breakdown.active)
+        return self.weighter.weighted_sum(terms, breakdown.active)
+
     def _emit_step_record(
         self,
         *,
@@ -353,7 +446,12 @@ class Trainer:
 
         self._consume_sampler()
         model.train()
-        model.zero_grad(set_to_none=True)
+        # Clear gradients through the OPTIMIZER, not just model.parameters():
+        # in learned weighting mode log_s is a trainable parameter owned by the
+        # optimizer but not by the model. model.zero_grad() would leave its
+        # gradient accumulating across steps, making weight updates depend on
+        # step history and breaking kill/resume trajectory reproducibility.
+        self.optimizer.zero_grad(set_to_none=True)
 
         model_kwargs = {key: batch[key] for key in _MODEL_INPUT_KEYS if key in batch}
         if "input_ids" not in model_kwargs:
@@ -361,6 +459,26 @@ class Trainer:
         if "option_mask" not in batch:
             raise TrainerError("batch is missing 'option_mask'")
         label_kwargs = {key: batch[key] for key in _LOSS_KEYS if key in batch}
+
+        # DataLoaders conventionally produce CPU tensors. Model parameters and
+        # every label/index tensor must agree with the trainer device; moving
+        # only model inputs still breaks advanced indexing in choice/preference
+        # losses. Preserve non-tensor metadata and container structure.
+        def on_device(value: Any) -> Any:
+            if torch.is_tensor(value):
+                return value.to(self.device)
+            if isinstance(value, Mapping):
+                return {key: on_device(item) for key, item in value.items()}
+            if isinstance(value, tuple):
+                return tuple(on_device(item) for item in value)
+            if isinstance(value, list):
+                return [on_device(item) for item in value]
+            return value
+
+        model_kwargs = {key: on_device(value) for key, value in model_kwargs.items()}
+        label_kwargs = {key: on_device(value) for key, value in label_kwargs.items()}
+        batch = dict(batch)
+        batch["option_mask"] = on_device(batch["option_mask"])
 
         device_type = self.device if self.device in ("cpu", "cuda", "mps") else "cpu"
         with torch.autocast(
@@ -385,13 +503,46 @@ class Trainer:
                     nonfinite_steps=self.nonfinite_steps,
                 )
 
+        # A batch with no active loss term yields a detached zero. Backward on
+        # it would raise a raw RuntimeError ("element 0 of tensors does not
+        # require grad"). Treat it as a typed skip instead: no optimizer step,
+        # no scheduler step, no step counter advance, no nonfinite counter
+        # change (nothing diverged — there was simply nothing to learn from).
+        if not any(breakdown.active.values()):
+            reason = "no_active_terms"
+            self._emit_step_record(loss=None, skipped=True, reason=reason, grad_norm=None)
+            return StepResult(
+                step=self.step,
+                epoch=self.epoch,
+                loss=None,
+                skipped=True,
+                reason=reason,
+                sampler_offset=self.sampler_offset,
+                nonfinite_steps=self.nonfinite_steps,
+                active=breakdown.active,
+            )
+
         # The loss is carried in FP32 (t4-optimization.md §2); casting from
         # the fp16 graph is exact and keeps the scaler boundary finite.
-        loss = breakdown.total.float()
+        loss = self._weighted_total(breakdown).float()
         self.scaler.scale(loss).backward()
         self.scaler.unscale_(self.optimizer)
 
-        if not _grads_finite(model):
+        # One global-norm sync replaces a per-parameter isfinite() loop: any
+        # inf/NaN gradient makes the returned total norm inf/NaN. clip_grad_norm_
+        # must run after unscale_ and before the step, exactly as before.
+        optimized_parameters = list(
+            {
+                id(parameter): parameter
+                for group in self.optimizer.param_groups
+                for parameter in group["params"]
+                if parameter.requires_grad
+            }.values()
+        )
+        grad_norm_t = torch.nn.utils.clip_grad_norm_(
+            optimized_parameters, self.config.grad_clip_norm
+        )
+        if not bool(torch.isfinite(grad_norm_t)):
             reason = "gradient_not_finite"
             # Let the scaler back off before the next attempt.
             self.scaler.update()
@@ -405,12 +556,10 @@ class Trainer:
                 reason=reason,
                 sampler_offset=self.sampler_offset,
                 nonfinite_steps=self.nonfinite_steps,
+                active=breakdown.active,
             )
 
-        grad_norm_t = torch.nn.utils.clip_grad_norm_(
-            model.parameters(), self.config.grad_clip_norm
-        )
-        grad_norm = float(grad_norm_t) if torch.isfinite(grad_norm_t) else None
+        grad_norm = float(grad_norm_t)
 
         self.scaler.step(self.optimizer)
         self.scaler.update()
@@ -432,6 +581,7 @@ class Trainer:
             sampler_offset=self.sampler_offset,
             nonfinite_steps=self.nonfinite_steps,
             grad_norm=grad_norm,
+            active=breakdown.active,
         )
 
     def fit(
@@ -448,13 +598,42 @@ class Trainer:
         ``DataLoader``); it is iterated once per epoch.
         """
         self._require_model()
-        total_epochs = self.config.epochs if epochs is None else epochs
-        if isinstance(total_epochs, bool) or not isinstance(total_epochs, int) or total_epochs < 1:
-            raise TrainerError(f"epochs must be an integer >= 1, got {total_epochs!r}")
+        # Kernel flags are process state and must be restored in every process;
+        # RNG streams are seeded only for a fresh run (load() restores them).
+        configure_determinism(self.config.determinism)
+        if self.step == 0 and self.epoch == 0:
+            set_seed(self.config.seed, self.config.determinism)
+        if epochs is not None:
+            if isinstance(epochs, bool) or not isinstance(epochs, int) or epochs < 1:
+                raise TrainerError(f"epochs must be an integer >= 1, got {epochs!r}")
+            total_epochs = epochs
+        else:
+            # Resume-aware: only the epochs left in the planned budget run.
+            total_epochs = max(0, self.config.epochs - self.epoch)
         history: list[StepResult] = []
         for _ in range(total_epochs):
-            for batch in dataloader:
+            epoch_start = len(history)
+            # sampler_offset counts consumed batches, including typed skips.
+            # A mid-epoch resume must skip exactly that many rows rather than
+            # replaying them. This requires a re-iterable, fixed-order loader;
+            # shuffled loaders need an explicit deterministic sampler.
+            skip = 0
+            if self.epoch == 0 and self.sampler_offset:
+                try:
+                    skip = self.sampler_offset % len(dataloader)
+                except TypeError as exc:
+                    raise TrainerError(
+                        "mid-epoch resume requires a sized, fixed-order dataloader"
+                    ) from exc
+            for batch in islice(dataloader, skip, None):
+                if self.step >= self.config.steps:
+                    break
                 history.append(self.train_batch(batch))
+            # The epoch counter denotes COMPLETED epochs: increment before the
+            # epoch-end checkpoint so resume does not replay this epoch.
+            self.epoch += 1
+            self.nonfinite_steps_epoch = 0
+            self._log_epoch(history[epoch_start:])
             self.save()  # epoch-end checkpoint
             if self.logger is not None:
                 self.logger.log(
@@ -467,9 +646,26 @@ class Trainer:
                         "nonfinite_steps": self.nonfinite_steps,
                     },
                 )
-            self.epoch += 1
-            self.nonfinite_steps_epoch = 0
+            if self.step >= self.config.steps:
+                break
         return history
+
+    def _log_epoch(self, history: list[StepResult]) -> None:
+        """Emit the per-epoch task-weight record (A4 / FR-TRAIN-03)."""
+        if self.weighter is None:
+            return
+        active: dict[str, bool] = {name: False for name in DEFAULT_TASK_NAMES}
+        for result in history:
+            if result.active:
+                for name, flag in result.active.items():
+                    active[name] = active[name] or bool(flag)
+        losses = [result.loss for result in history if result.loss is not None]
+        metrics: dict[str, Any] = {"active": active}
+        if losses:
+            metrics["loss"] = sum(losses) / len(losses)
+        self.weighter.log_epoch(
+            self.logger, epoch=self.epoch, metrics=metrics, step=self.step
+        )
 
     # ------------------------------------------------------------ checkpoints
     def state_dict(self) -> dict[str, Any]:
@@ -486,6 +682,7 @@ class Trainer:
             "optimizer": self.optimizer.state_dict(),
             "scaler": self.scaler.state_dict(),
             "scheduler": self.scheduler.state_dict(),
+            "weighter": self.weighter.state_dict() if self.weighter is not None else None,
             "rng": _rng_state(),
             "config": self.config.to_dict(),
         }
@@ -494,7 +691,32 @@ class Trainer:
         """Write ``checkpoint_step{N}.pt`` atomically plus its ``.sha256`` sidecar."""
         directory = Path(directory) if directory is not None else Path(self.config.checkpoint_dir)
         payload = self.state_dict()
-        return save_checkpoint(payload, directory, self.step)
+        path = save_checkpoint(payload, directory, self.step)
+        self._prune_checkpoints(directory)
+        return path
+
+    def _prune_checkpoints(self, directory: Path) -> None:
+        """Keep only the N most recent ``checkpoint_step*.pt`` files, if asked.
+
+        ``keep_last_n=None`` (the default) keeps everything. Only files whose
+        names match the checkpoint pattern inside ``directory`` are ever
+        considered, and the just-written checkpoint is never deleted.
+        """
+        keep = self.config.keep_last_n
+        if keep is None or not directory.is_dir():
+            return
+        candidates: list[tuple[int, Path]] = []
+        for child in directory.iterdir():
+            step = step_from_filename(child)
+            if step is None or not child.is_file():
+                continue
+            candidates.append((step, child))
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        for step, child in candidates[keep:]:
+            if step == self.step:  # never remove the current run's newest artifact
+                continue
+            child.unlink(missing_ok=True)
+            sidecar_path(child).unlink(missing_ok=True)
 
     def load(self, source: str | Path) -> int:
         """Restore all state from a checkpoint file or a directory.
@@ -530,7 +752,21 @@ class Trainer:
                 steps=self.config.steps,
             )
 
-        payload = load_checkpoint_payload(path)  # verifies the hash first
+        payload = load_checkpoint_payload(path)  # verifies hash + format version
+
+        saved_config = payload.get("config")
+        comparable_saved = (
+            {key: saved_config[key] for key in self.config.resume_dict() if key in saved_config}
+            if isinstance(saved_config, Mapping)
+            else saved_config
+        )
+        if comparable_saved != self.config.resume_dict():
+            raise CheckpointError(
+                f"checkpoint {path} was written with a different training config "
+                "(trajectory-defining settings); "
+                "refusing to resume with mismatched settings",
+                key="config",
+            )
 
         try:
             payload_step = int(payload["step"])
@@ -548,19 +784,61 @@ class Trainer:
                 steps=self.config.steps,
             )
 
-        self.model.load_state_dict(payload["model"])
-        self.optimizer.load_state_dict(payload["optimizer"])
-        self.scaler.load_state_dict(payload.get("scaler") or {})
-        self.scheduler.load_state_dict(payload["scheduler"])
-        rng = payload.get("rng")
-        if isinstance(rng, Mapping):
+        # Validate the complete payload BEFORE mutating live state. A late
+        # scaler/scheduler/RNG failure must not leave a hybrid trainer behind.
+        for key in ("model", "optimizer", "scaler", "scheduler", "rng"):
+            if not isinstance(payload.get(key), Mapping):
+                raise CheckpointError(
+                    f"checkpoint {path} is missing a valid {key!r} state", key=key
+                )
+        rng = payload["rng"]
+        for key in ("python", "numpy", "torch"):
+            if rng.get(key) is None:
+                raise CheckpointError(
+                    f"checkpoint {path} RNG state is missing {key!r}", key="rng"
+                )
+        if self.weighter is not None and not isinstance(payload.get("weighter"), Mapping):
+            raise CheckpointError(
+                f"checkpoint {path} is missing a valid 'weighter' state", key="weighter"
+            )
+        counters: dict[str, int] = {}
+        for key in ("epoch", "sampler_offset", "nonfinite_steps", "nonfinite_steps_epoch"):
+            value = payload.get(key)
+            if type(value) is not int or value < 0:
+                raise CheckpointError(
+                    f"checkpoint {path} has invalid {key!r}: {value!r}", key=key
+                )
+            counters[key] = value
+
+        before = copy.deepcopy(self.state_dict())
+        rng_before = _rng_state()
+        try:
+            self.model.load_state_dict(payload["model"])
+            self.optimizer.load_state_dict(payload["optimizer"])
+            self.scaler.load_state_dict(dict(payload["scaler"]))
+            self.scheduler.load_state_dict(payload["scheduler"])
+            if self.weighter is not None:
+                self.weighter.load_state_dict(payload["weighter"])
             _restore_rng(rng)
+            configure_determinism(self.config.determinism)
+        except Exception as exc:
+            # Roll back every mutation, including RNG and counters.
+            self.model.load_state_dict(before["model"])
+            self.optimizer.load_state_dict(before["optimizer"])
+            self.scaler.load_state_dict(before["scaler"])
+            self.scheduler.load_state_dict(before["scheduler"])
+            if self.weighter is not None and before.get("weighter") is not None:
+                self.weighter.load_state_dict(before["weighter"])
+            _restore_rng(rng_before)
+            if isinstance(exc, CheckpointError):
+                raise
+            raise CheckpointError(f"checkpoint {path} could not be restored: {exc}") from exc
 
         self.step = payload_step
-        self.epoch = int(payload.get("epoch", 0))
-        self.sampler_offset_restore(int(payload.get("sampler_offset", 0)))
-        self.nonfinite_steps = int(payload.get("nonfinite_steps", 0))
-        self.nonfinite_steps_epoch = int(payload.get("nonfinite_steps_epoch", 0))
+        self.epoch = counters["epoch"]
+        self.sampler_offset_restore(counters["sampler_offset"])
+        self.nonfinite_steps = counters["nonfinite_steps"]
+        self.nonfinite_steps_epoch = counters["nonfinite_steps_epoch"]
         return self.step
 
     def sampler_offset_restore(self, offset: int) -> None:

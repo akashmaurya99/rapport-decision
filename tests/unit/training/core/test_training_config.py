@@ -35,6 +35,43 @@ def test_defaults_match_design() -> None:
     assert config.nonfinite_per_epoch == 10
 
 
+def test_new_fields_default_to_backward_compatible_values() -> None:
+    config = TrainingConfig()
+    assert config.head_lr is None
+    assert config.determinism == "strict"
+    assert config.weight_mode == "fixed"
+    assert config.keep_last_n is None
+    # They round-trip through to_dict()/from_mapping() like every other key.
+    assert TrainingConfig.from_mapping(config.to_dict()) == config
+
+
+def test_new_fields_validate() -> None:
+    from src.training.core import TrainerConfigError
+
+    with pytest.raises(TrainerConfigError):
+        TrainingConfig.from_mapping({"head_lr": 0.0})
+    with pytest.raises(TrainerConfigError):
+        TrainingConfig.from_mapping({"head_lr": float("nan")})
+    with pytest.raises(TrainerConfigError):
+        TrainingConfig.from_mapping({"head_lr": "1e-3"})
+    assert TrainingConfig.from_mapping({"head_lr": 1.0e-3}).head_lr == pytest.approx(1.0e-3)
+
+    with pytest.raises(TrainerConfigError):
+        TrainingConfig.from_mapping({"determinism": "sloppy"})
+    assert TrainingConfig.from_mapping({"determinism": "relaxed"}).determinism == "relaxed"
+
+    with pytest.raises(TrainerConfigError):
+        TrainingConfig.from_mapping({"weight_mode": "auto"})
+    for mode in ("learned", "fixed", "uniform"):
+        assert TrainingConfig.from_mapping({"weight_mode": mode}).weight_mode == mode
+
+    with pytest.raises(TrainerConfigError):
+        TrainingConfig.from_mapping({"keep_last_n": 0})
+    with pytest.raises(TrainerConfigError):
+        TrainingConfig.from_mapping({"keep_last_n": -1})
+    assert TrainingConfig.from_mapping({"keep_last_n": 3}).keep_last_n == 3
+
+
 def test_to_dict_round_trip() -> None:
     config = TrainingConfig(steps=100, checkpoint_every=7)
     rebuilt = TrainingConfig.from_mapping(config.to_dict())

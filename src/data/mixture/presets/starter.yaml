@@ -1,6 +1,11 @@
 # 55k starter mixture — docs/dataset-strategy.md §6 ("Starter subset (55,000)").
-# choice 12,000 · preference 20,000 (HH-RLHF 16,000 + HelpSteer2 4,000) ·
-# scoring 5,000 · probability 4,600 · abstention 6,600 · risk 6,800 = 55,000.
+# choice 12,000 · preference 20,000 (HH-RLHF only) · scoring 5,000 ·
+# probability 4,600 · abstention 6,600 · risk 6,800 = 55,000.
+#
+# HelpSteer2 is scored only: PreferenceAdapter consumes HH-RLHF chosen/rejected
+# pairs and cannot consume HelpSteer2 ratings, so the 4,000 preference rows
+# formerly attributed to HelpSteer2 are now attributed to HH-RLHF. Family and
+# total row counts are unchanged.
 #
 # `fingerprint` is deliberately "" while the split-manifest fingerprint is
 # unresolved (recorded at acquisition time); load with
@@ -11,9 +16,7 @@ name: starter
 fingerprint: ""
 families:
   choice: {source: "cais/mmlu#auxiliary_train", rows: 12000}
-  preference:
-    - {source: "Anthropic/hh-rlhf", rows: 16000}
-    - {source: "nvidia/HelpSteer2", rows: 4000}
+  preference: {source: "Anthropic/hh-rlhf", rows: 20000}
   scoring: {source: "nvidia/HelpSteer2", rows: 5000}
   probability:
     - {source: "truthfulqa/truthful_qa", rows: 1600}

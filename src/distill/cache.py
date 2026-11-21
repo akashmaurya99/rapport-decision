@@ -2,15 +2,19 @@
 
 Layout (relative to ``options.cache_dir``, default ``cache/teacher``)::
 
-    <teacher_id>/<example_id>.json   one float-array payload per example
-    <teacher_id>/index.json          index of known-good entries
+    <teacher_id>/<example_id>.<template_hash[:12]>.json
+                                    one float-array payload per (example, template)
+    <teacher_id>/index.json         index of known-good entries
 
 ``<teacher_id>`` is filesystem-sanitized (``[A-Za-z0-9._-]`` kept, everything
 else replaced by ``_``) so ids such as ``Qwen/Qwen3-1.7B`` cannot escape the
 directory; the raw id is stored inside every file for fidelity.
 ``template_hash`` is the sha256 hex digest of the template string. The
 cache key is the triple ``(teacher_id, template_hash, example_id)`` — a
-rerun with an identical triple performs **zero teacher forwards**.
+rerun with an identical triple performs **zero teacher forwards**. The
+template hash is part of the filename (and of the index key), so switching
+templates A→B→A keeps A's payload intact instead of overwriting it with B's
+and thrashing back to zero hits.
 
 Corruption handling: every payload carries ``payload_hash`` (sha256 of the
 canonical JSON of the payload fields). A file whose payload hash does not
@@ -48,7 +52,10 @@ from .errors import DistillInputError, TeacherUnavailableError
 from .teacher import DEFAULT_TEMPLATE, Teacher, load_local_teacher, render_prompt
 
 CACHE_VERSION = 1
-INDEX_VERSION = 1
+#: Bumped to 2 when entry filenames became template-keyed: a version-1 index
+#: mixes the legacy ``<example_id>.json`` schema with the current one and is
+#: discarded rather than merged.
+INDEX_VERSION = 2
 DEFAULT_CACHE_ROOT = "cache/teacher"
 _SANITIZE_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
@@ -58,6 +65,25 @@ def template_hash(template: str) -> str:
     if not isinstance(template, str) or not template:
         raise DistillInputError("template must be a non-empty string", field="template")
     return hashlib.sha256(template.encode("utf-8")).hexdigest()
+
+
+#: Number of leading template-hash characters embedded in entry filenames.
+_TEMPLATE_HASH_PREFIX = 12
+
+
+def entry_filename(example_id: str, thash: str) -> str:
+    """Filename for one ``(example_id, template_hash)`` entry.
+
+    The full triple is still verified from the payload on read; the hash
+    prefix in the name keeps two templates for the same example from sharing
+    (and overwriting) one file.
+    """
+    return f"{example_id}.{thash[:_TEMPLATE_HASH_PREFIX]}.json"
+
+
+def index_key(thash: str, example_id: str) -> str:
+    """Index key for one ``(template_hash, example_id)`` pair."""
+    return f"{thash}:{example_id}"
 
 
 def sanitize_teacher_id(teacher_id: str) -> str:
@@ -192,11 +218,37 @@ def build_soft_label_cache(
     inflight: dict[str, int] = {}  # example_id -> position that owns the forward
     recomputed = 0
     for position, example in enumerate(example_list):
-        entry_path = teacher_dir / f"{example.example_id}.json"
+        entry_path = teacher_dir / entry_filename(example.example_id, thash)
         cached = _read_entry(entry_path,
                              teacher_id=teacher_id, template_hash=thash,
                              example_id=example.example_id,
                              option_count=len(example.options))
+        if cached is None:
+            # Legacy (pre-template-keying) entries used "<example_id>.json".
+            # Migrate a valid one instead of paying a teacher forward again.
+            legacy_path = teacher_dir / f"{example.example_id}.json"
+            legacy = _read_entry(legacy_path,
+                                 teacher_id=teacher_id, template_hash=thash,
+                                 example_id=example.example_id,
+                                 option_count=len(example.options))
+            if legacy is not None:
+                logprobs, entropy = legacy
+                payload_hash = _write_entry(
+                    entry_path, teacher_id=teacher_id, template_hash=thash,
+                    example_id=example.example_id, logprobs=logprobs, entropy=entropy,
+                )
+                cache_index["entries"][index_key(thash, example.example_id)] = {
+                    "template_hash": thash,
+                    "example_id": example.example_id,
+                    "option_count": len(example.options),
+                    "entropy": entropy,
+                    "file": entry_path.name,
+                    "payload_hash": payload_hash,
+                }
+                legacy_path.unlink(missing_ok=True)
+                resolved[position] = (logprobs, entropy, False)
+                cache_hit_positions.add(position)
+                continue
         if cached is not None:
             logprobs, entropy = cached
             resolved[position] = (logprobs, entropy, False)
@@ -228,15 +280,17 @@ def build_soft_label_cache(
         teacher_forwards += 1
         logprobs = _coerce_logprobs(raw, len(example.options), example.example_id)
         entropy = entropy_from_logprobs(logprobs)
-        payload_hash = _write_entry(teacher_dir / f"{example.example_id}.json",
+        filename = entry_filename(example.example_id, thash)
+        payload_hash = _write_entry(teacher_dir / filename,
                                     teacher_id=teacher_id, template_hash=thash,
                                     example_id=example.example_id, logprobs=logprobs,
                                     entropy=entropy)
-        cache_index["entries"][example.example_id] = {
+        cache_index["entries"][index_key(thash, example.example_id)] = {
             "template_hash": thash,
+            "example_id": example.example_id,
             "option_count": len(example.options),
             "entropy": entropy,
-            "file": f"{example.example_id}.json",
+            "file": filename,
             "payload_hash": payload_hash,
         }
         resolved[position] = (logprobs, entropy, True)
@@ -250,7 +304,7 @@ def build_soft_label_cache(
         owner = inflight[example.example_id]
         resolved[position] = resolved[owner]
 
-    if pending:
+    if pending or cache_hit_positions:
         _write_index(teacher_dir / "index.json", cache_index)
 
     # --- batch entropy filter (95th percentile, documented constant) ---------

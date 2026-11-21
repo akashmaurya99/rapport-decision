@@ -106,7 +106,21 @@ def test_rows_without_chosen_index_join_the_contested_group(example_factory):
     assert result.kept == ()
 
 
-def test_groups_with_only_none_labels_are_not_contested(example_factory):
+def test_groups_with_identical_full_label_payloads_are_not_contested(example_factory):
+    a = example_factory(
+        family="scoring", chosen_index=None, scores=(0.5, 0.5, 0.5), group_id="g-s-a"
+    )
+    b = example_factory(
+        family="scoring", chosen_index=None, scores=(0.5, 0.5, 0.5), group_id="g-s-b"
+    )
+
+    result = ContradictionAudit().run([a, b])
+
+    assert result.kept == (a, b)
+    assert result.contested == ()
+
+
+def test_conflicting_scores_are_contested(example_factory):
     a = example_factory(
         family="scoring", chosen_index=None, scores=(0.5, 0.5, 0.5), group_id="g-s-a"
     )
@@ -116,8 +130,8 @@ def test_groups_with_only_none_labels_are_not_contested(example_factory):
 
     result = ContradictionAudit().run([a, b])
 
-    assert result.kept == (a, b)
-    assert result.contested == ()
+    assert result.kept == ()
+    assert result.contested_count == 2
 
 
 def test_write_contested_returns_row_count(example_factory, tmp_path):

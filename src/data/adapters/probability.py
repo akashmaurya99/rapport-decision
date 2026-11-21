@@ -30,6 +30,14 @@ fixed directive ``"Is this proposition true?"`` (the spec's truth-verification
 question). ``example_id`` is computed by the TASK-03 builder; option order is
 shuffled at ingest and reconstructed via ``meta.original_order``.
 
+Provenance is **per shape**: auxiliary_train-derived rows carry the derived
+source id ``cais/mmlu#auxiliary_train-derived-binary`` and the MIT license,
+never the TruthfulQA/Apache-2.0 class attributes (those apply to shape 2
+only). When an acquisition manifest is supplied for ``cais/mmlu``, its
+license is used in preference to the MIT default; a quarantined manifest is
+never trusted. The resolved provenance is recorded in
+``report["provenance"]``.
+
 Note on ``answerable`` for this family: the spec masks the abstention loss
 when ``answerable`` is unset, and probability rows are not abstention rows —
 the per-task loss masking is keyed off ``task_family`` there. Setting
@@ -49,6 +57,7 @@ from .base import (
     DEFAULT_MAX_FIELD_CHARS,
     DEFAULT_MAX_STATE_CHARS,
     DEFAULT_SEED,
+    AdapterError,
     AdapterResult,
     ExampleMeta,
     RejectedRecord,
@@ -66,6 +75,37 @@ from .choice import _parse_gold
 
 GOAL = "Is this proposition true?"
 YES, NO = "Yes", "No"
+
+#: Shape-1 provenance. The derived rows are not TruthfulQA data.
+MMLU_SOURCE = "cais/mmlu#auxiliary_train-derived-binary"
+MMLU_LICENSE = "MIT"
+
+
+def license_from_manifest(manifest: Any | None, *, default: str) -> str:
+    """Resolve a license from an acquisition manifest, never from quarantine.
+
+    ``manifest`` is duck-typed (a :class:`~src.data.acquire.SourceManifest`
+    in production, a simple object or mapping in tests). No manifest means the
+    caller explicitly uses the adapter's declared provenance. Once a manifest
+    is supplied, only an admitted source with a real license is accepted;
+    quarantine or missing provenance can never fall back to an invented MIT.
+    """
+    if manifest is None:
+        return default
+    if isinstance(manifest, Mapping):
+        status = manifest.get("status")
+        license_ = manifest.get("license")
+    else:
+        status = getattr(manifest, "status", None)
+        license_ = getattr(manifest, "license", None)
+    normalized_status = str(status).strip().lower() if status is not None else ""
+    if normalized_status != "admitted":
+        raise AdapterError(
+            f"cais/mmlu acquisition status {normalized_status or 'missing'!r} is not admitted"
+        )
+    if not isinstance(license_, str) or not license_.strip():
+        raise AdapterError("admitted cais/mmlu manifest carries no usable license")
+    return license_.strip()
 
 
 class ProbabilityAdapter:
@@ -86,6 +126,9 @@ class ProbabilityAdapter:
         source: str | None = None,
         license: str | None = None,
         default_split: str | None = None,
+        mmlu_source: str = MMLU_SOURCE,
+        mmlu_license: str | None = None,
+        mmlu_manifest: Any | None = None,
     ) -> None:
         self.seed = seed
         self.max_state_chars = max_state_chars
@@ -96,6 +139,10 @@ class ProbabilityAdapter:
             self.license = license
         if default_split is not None:
             self.default_split = default_split
+        self.mmlu_source = mmlu_source
+        self.mmlu_license = license_from_manifest(
+            mmlu_manifest, default=MMLU_LICENSE if mmlu_license is None else mmlu_license
+        )
 
     # -- shared bits -----------------------------------------------------------
 
@@ -108,6 +155,8 @@ class ProbabilityAdapter:
         split: str,
         fingerprint: str,
         origin: str,
+        source: str,
+        license_: str,
     ) -> tuple[dict[str, Any], ExampleMeta]:
         order, per_row_seed = shuffle_order(
             2, master_seed=self.seed, row_fingerprint=f"{fingerprint}:{state}"
@@ -119,8 +168,8 @@ class ProbabilityAdapter:
             "goal": GOAL,
             "state": state,
             "options": [{"text": t} for t in emitted],
-            "source": self.source,
-            "license": self.license,
+            "source": source,
+            "license": license_,
             "group_id": group_id,
             "split": split,
             "chosen_index": gold_position,
@@ -169,7 +218,7 @@ class ProbabilityAdapter:
             options.append(capped)
         gold = _parse_gold(row.get("answer"), len(options))
         split = split_for(row, self.default_split)
-        group_id = group_id_for(row, self.source, fingerprint)
+        group_id = group_id_for(row, self.mmlu_source, fingerprint)
         question = length_cap(question.strip(), max_chars=self.max_state_chars, field="question")
 
         derived: list[tuple[dict[str, Any], ExampleMeta]] = []
@@ -187,6 +236,8 @@ class ProbabilityAdapter:
                     split=split,
                     fingerprint=fingerprint,
                     origin="mmlu-auxiliary-train",
+                    source=self.mmlu_source,
+                    license_=self.mmlu_license,
                 )
             )
         return derived
@@ -245,6 +296,8 @@ class ProbabilityAdapter:
                     split=split,
                     fingerprint=fingerprint,
                     origin="truthfulqa",
+                    source=self.source,
+                    license_=self.license,
                 )
             )
         return derived
@@ -304,6 +357,13 @@ class ProbabilityAdapter:
                 "derived_binary_rows": derived,
                 "truthfulqa_yes_rows": yes_rows,
                 "truthfulqa_no_rows": no_rows,
+                "provenance": {
+                    "mmlu_auxiliary_train_derived": {
+                        "source": self.mmlu_source,
+                        "license": self.mmlu_license,
+                    },
+                    "truthfulqa": {"source": self.source, "license": self.license},
+                },
             },
         )
         return AdapterResult(examples=examples, rejected=rejected, meta=metas, report=report)

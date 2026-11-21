@@ -1,6 +1,12 @@
-# RAPPORT base run configuration. Every experiment config extends this file;
-# keep it scoped to config only (no model hyperparameters beyond training loop
-# controls) and free of unknown keys — the loader rejects them.
+# RAPPORT base run configuration — AUTHORITATIVE DEFAULTS for the shared
+# (ResolvedConfig) fields. `load_experiment_config` merges this file BEFORE
+# each experiment YAML, so an experiment only needs to declare what differs.
+# `load_config` (legacy/tests) reads this same file directly. Keep these
+# values in sync with src/config/schema.py::BASE_DEFAULTS (the packaged
+# fallback used when no YAML files ship with the installed distribution).
+# Scope: config only (no model hyperparameters beyond training-loop controls),
+# no unknown keys — both loaders reject them. LR matches the experiment YAMLs
+# (`lr: 3.0e-4`); the old 3e-5 value was a stale parallel default.
 seed: 13
 device: cuda
 data_dir: data
@@ -9,7 +15,7 @@ fp16: true
 determinism: strict
 epochs: 10
 batch_size: 16
-learning_rate: 3.0e-5
+learning_rate: 3.0e-4
 max_length: 512
 teacher: Qwen/Qwen3-1.7B
 data_fingerprint: ""

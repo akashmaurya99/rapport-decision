@@ -20,7 +20,7 @@ def test_answerable_row_maps_with_yes_gold():
     assert example.task_family == "abstention"
     assert example.answerable is True
     assert example.options[example.chosen_index].text == "Answerable"
-    assert example.source == "AbstentionBench"
+    assert example.source == "AbstentionBench-derived"
     assert example.group_id == "subset_a-1"
     assert result.meta[0].subset == "subset_a"
 

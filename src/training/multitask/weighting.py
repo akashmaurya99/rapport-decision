@@ -186,21 +186,35 @@ class TaskWeighter(nn.Module):
         al.). Inactive therefore means "no data this step", not "excluded
         from weighting".
         """
+        return self.weighted_sum(losses, active) + self._clamped_s().sum()
+
+    # Public compatibility alias: identical to forward(), including the Kendall
+    # regulariser. Do not replace it with weighted_sum(), which omits Σs.
+    loss = forward
+
+    def weighted_sum(
+        self,
+        losses: Mapping[str, Tensor] | Sequence[Tensor],
+        active: Mapping[str, bool] | None = None,
+    ) -> Tensor:
+        """Return ``Σ_t w_t · L_t`` over active tasks, without the ``s_t`` term.
+
+        This is the fixed / uniform arm's weighted total: the Kendall
+        regulariser ``Σ_t s_t`` is deliberately excluded so the resolved
+        fixed weights reproduce a plain weighted sum exactly.
+        """
         per_task = self._resolve_losses(losses)
         if active is not None:
             for key in active:
                 if key not in self.task_names:
                     raise ValueError(f"active contains unknown task {key!r}")
         clamped_s = self._clamped_s()
-        total = clamped_s.sum()
+        total = clamped_s.new_zeros(())
         for index, name in enumerate(self.task_names):
             if active is not None and not bool(active.get(name, True)):
                 continue
             total = total + torch.exp(-clamped_s[index]) * per_task[index]
         return total
-
-    # Backwards-friendly alias: some call sites read better with an explicit verb.
-    loss = forward
 
     def _resolve_losses(self, losses: Mapping[str, Tensor] | Sequence[Tensor]) -> list[Tensor]:
         if isinstance(losses, Mapping):

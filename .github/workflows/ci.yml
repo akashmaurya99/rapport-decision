@@ -2,22 +2,58 @@ name: ci
 
 'on':
   push:
+  pull_request:
 
 jobs:
   quality:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: pip
-          cache-dependency-path: pyproject.toml
-      - name: Install
-        run: python -m pip install -e .[dev]
+          cache-dependency-path: |
+            pyproject.toml
+            requirements.lock
+      - name: Install (pinned lock)
+        # requirements.lock is the reproducible source of truth for CI.
+        run: python -m pip install -c requirements.lock -e .[dev]
       - name: Lint
         run: ruff check .
       - name: Typecheck
         run: mypy src
       - name: Test
         run: pytest -q
+      - name: Installed-package import smoke test (outside checkout)
+        # Guards the packaging contract: all code imports src.*, and the
+        # distribution must NOT expose generic top-level config/model/... .
+        working-directory: ${{ runner.temp }}
+        run: |
+          python - <<'PY'
+          import importlib
+          expected = [
+              "src.config.loader", "src.model.head", "src.training.core",
+              "src.data.core.schema", "src.calibration", "src.evaluation",
+              "src.inference", "src.distill", "src.ops", "rapport",
+          ]
+          for name in expected:
+              importlib.import_module(name)
+              print("import OK:", name)
+          forbidden = ["config", "model", "data", "training", "tokenization",
+                       "ops", "distill", "calibration", "evaluation", "inference"]
+          for name in forbidden:
+              try:
+                  importlib.import_module(name)
+              except ModuleNotFoundError:
+                  continue
+              raise SystemExit(f"unexpected generic top-level package: {name}")
+          print("no generic top-level packages leaked")
+          PY
+      - name: Dependency audit
+        # Advisory: report known vulnerabilities without breaking existing gates.
+        continue-on-error: true
+        run: |
+          python -m pip install pip-audit
+          pip-audit -r requirements.lock

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from src.data.adapters.base import AdapterError
 from src.data.adapters.probability import ProbabilityAdapter
 
 
@@ -35,10 +36,40 @@ def test_auxiliary_train_row_yields_one_binary_row_per_option():
     assert result.report["input_rows"] == 1
     for example in result.examples:
         assert example.task_family == "probability"
-        assert example.source == "truthfulqa/truthful_qa"
+        assert example.source == "cais/mmlu#auxiliary_train-derived-binary"
+        assert example.license == "MIT"
         assert example.group_id == "aux-1"  # shared with parent: never straddle a split
         assert [o.text for o in example.options] in (["Yes", "No"], ["No", "Yes"])
         assert "Is '" in example.state and "the correct answer?" in example.state
+
+
+def test_auxiliary_rows_never_inherit_truthfulqa_provenance():
+    result = ProbabilityAdapter(seed=17).to_decision_example([aux_row(), tqa_row()])
+    derived = [e for e in result.examples if "correct answer?" in e.state]
+    originals = [e for e in result.examples if "Proposition:" in e.state]
+    assert derived and originals
+    assert all(e.source == "cais/mmlu#auxiliary_train-derived-binary" for e in derived)
+    assert all(e.license == "MIT" for e in derived)
+    assert all(e.source == "truthfulqa/truthful_qa" for e in originals)
+    assert all(e.license == "Apache-2.0" for e in originals)
+    assert result.report["provenance"]["mmlu_auxiliary_train_derived"] == {
+        "source": "cais/mmlu#auxiliary_train-derived-binary",
+        "license": "MIT",
+    }
+
+
+def test_manifest_license_is_honored_but_quarantine_is_not():
+    class Manifest:
+        def __init__(self, status, license):
+            self.status = status
+            self.license = license
+
+    admitted = ProbabilityAdapter(mmlu_manifest=Manifest("admitted", "MIT-recorded"))
+    assert admitted.mmlu_license == "MIT-recorded"
+    with pytest.raises(AdapterError, match="not admitted"):
+        ProbabilityAdapter(mmlu_manifest=Manifest("quarantine", "unknown"))
+    with pytest.raises(AdapterError, match="no usable license"):
+        ProbabilityAdapter(mmlu_manifest=Manifest("admitted", ""))
 
 
 def test_exactly_one_derived_row_marks_the_gold():

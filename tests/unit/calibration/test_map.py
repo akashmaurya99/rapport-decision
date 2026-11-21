@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import math
 import sys
@@ -184,12 +185,22 @@ def test_apply_pooled_when_no_bucket_given(fitted_map):
     assert out.bucket_key == "pooled"
 
 
-def test_xstest_flag_hardcoded_false(fitted_map, tmp_path):
+def test_xstest_true_flag_is_rejected(fitted_map, tmp_path):
     assert fitted_map.xstest_used_for_fitting is False
     payload = fitted_map.to_dict()
     payload["xstest_used_for_fitting"] = True  # tampered file
-    tampered = CalibrationMap.from_dict(payload)
-    assert tampered.xstest_used_for_fitting is False
+    with pytest.raises(CalibrationMapError):
+        CalibrationMap.from_dict(payload)
+    # Constructing the map directly with a true flag is rejected too.
+    with pytest.raises(CalibrationMapError):
+        dataclasses.replace(fitted_map, xstest_used_for_fitting=True)
+
+
+def test_malformed_frozen_abstention_policy_is_rejected(fitted_map):
+    payload = fitted_map.to_dict()
+    payload["abstention"] = {"u_correct": "not-a-number"}
+    with pytest.raises(CalibrationMapError):
+        CalibrationMap.from_dict(payload)
 
 
 def test_calibration_entry_validation():

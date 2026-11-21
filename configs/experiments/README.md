@@ -13,26 +13,37 @@ computes verdicts.
 
 | Arm | Question | Config | Init (default) | Variant (default) | Mixture | Seeds |
 |---|---|---|---|---|---|---|
-| A1 | does pretraining help at 55k? | `a1-init.yaml` | `bge-small` (alts `random`, `all-MiniLM-L6-v2`) | compact | starter 55k | {13, 29, 47} |
-| A2 | is cosine enough? | `a2-readout.yaml` | `bge-small` | compact | starter 55k | {13, 29, 47} |
-| A3 | what does capacity buy? | `a3-depth.yaml` | `bge-small` | compact (alts ultra 6/320, large 16/448) | starter 55k | {13, 29, 47} |
-| A4 | does uncertainty weighting collapse a task? | `a4-weights.yaml` | `bge-small` | compact | starter 55k | {13, 29, 47} |
-| A5 | how much does the trunk learn? | `a5-head-only.yaml` | `bge-small` | compact | starter 55k | {13, 29, 47} |
-| A6 | payoff per example | `a6-data.yaml` | `bge-small` | compact | full 115.6k (alt arms 55k / +KD / uniform order) | {13} (subset permitted for A6) |
-| A7 | is the curriculum earning its complexity? | `a7-ordering.yaml` | `bge-small` | compact | starter 55k | {13, 29, 47} |
-| A8 | is RoPE extension safe? | `a8-context.yaml` | `bge-small` | compact | starter 55k | {13, 29, 47} |
-| — | 55k starter run (Stage B) | `starter.yaml` | `bge-small` | compact | starter 55k | {13, 29, 47} |
-| — | 115.6k acceptance run (Stage B) | `acceptance.yaml` | `bge-small` | compact | full 115.6k | {13, 29, 47} |
+| A1 | does pretraining help at 55k? | `a1-init.yaml` | `scratch` (alts `bge-small`, `random`, `all-MiniLM-L6-v2` — not executable yet) | compact | starter 55k | {13, 29, 47} |
+| A2 | is cosine enough? | `a2-readout.yaml` | `scratch` | compact | starter 55k | {13, 29, 47} |
+| A3 | what does capacity buy? | `a3-depth.yaml` | `scratch` | compact (alts ultra 6/320, large 16/448) | starter 55k | {13, 29, 47} |
+| A4 | does uncertainty weighting collapse a task? | `a4-weights.yaml` | `scratch` | compact | starter 55k | {13, 29, 47} |
+| A5 | how much does the trunk learn? | `a5-head-only.yaml` | `scratch` | compact | starter 55k | {13, 29, 47} |
+| A6 | payoff per example | `a6-data.yaml` | `scratch` | compact | full 115.6k (alt arms 55k / +KD / uniform order) | {13} (subset permitted for A6) |
+| A7 | is the curriculum earning its complexity? | `a7-ordering.yaml` | `scratch` | compact | starter 55k | {13, 29, 47} |
+| A8 | is RoPE extension safe? | `a8-context.yaml` | `scratch` | compact | starter 55k | {13, 29, 47} |
+| — | 55k starter run (Stage B) | `starter.yaml` | `scratch` | compact | starter 55k | {13, 29, 47} |
+| — | 115.6k acceptance run (Stage B) | `acceptance.yaml` | `scratch` | compact | full 115.6k | {13, 29, 47} |
+
+**What the runner enforces.** `scripts/e2e.py` refuses any experiment whose
+declared knob it cannot honor, instead of silently ignoring it. Today the
+executable set is: `init: scratch` (no pretrained-trunk loader exists),
+`readout: cosine`, `head_only: false`, `kd: false`, `label_smoothing: 0.0`,
+`optimizer: adamw`, `schedule: cosine`, `weight_floor: 0.05`,
+`weight_cap: 4.0`, `ordering: fingerprint` (the deterministic mixture order —
+the curriculum arm is not implemented), and a `context` value that agrees with
+`max_length`/`infer_max_length`. The alternates listed under each arm remain
+**declared but unexecuted**: the runner prints them, so no report implies an
+arm was measured when it was not.
 
 ## Arm-specific knobs
 
-- **A1** — `init` ∈ {`bge-small`, `random`, `all-MiniLM-L6-v2`} (`docs/evaluation.md` §5 `MiniLM-L6`; named per `docs/training-strategy.md` §2).
+- **A1** — `init` ∈ {`scratch` (executable), `bge-small`, `random`, `all-MiniLM-L6-v2` (declared; a pretrained-trunk loader is not implemented, so these arms cannot run yet — `docs/evaluation.md` §5 `MiniLM-L6`; named per `docs/training-strategy.md` §2).
 - **A2** — `readout` ∈ {`cosine`, `cross-attn`, `cls-pooled`} (cosine marker | joint cross-attention block | CLS-pooled MLP).
 - **A3** — `variant` ∈ {`ultra` 6×320 (11.91M), `compact` 12×384 (33.46M), `large` 16×448 (52.83M)}. Only compact is Y11-eligible.
 - **A4** — `weight_mode` ∈ {`learned` (floor 0.05, cap 4.0), `fixed`, `uniform`}; the learned arm watches for `WEIGHT_COLLAPSE`.
 - **A5** — `head_only` ∈ {`false` (full fine-tune, default), `true` (frozen trunk, B5 baseline twin)}.
 - **A6** — `mixture` ∈ {`starter` 55k, `full` 115.6k, `full` + `kd: true`, `full` + `ordering: uniform`}. The KD arm runs only after the T15 gate passes.
-- **A7** — `ordering` ∈ {`curriculum` (epochs 1–2 easy→hard; epochs 3+ uniform, hard oversampled 1.5×), `uniform`}.
+- **A7** — `ordering` ∈ {`fingerprint` (executable: the deterministic mixture order), `curriculum` (epochs 1–2 easy→hard; epochs 3+ uniform, hard oversampled 1.5× — not implemented), `uniform`}.
 - **A8** — `context` ∈ {`512-train-1024-infer` (`max_length: 512`, `infer_max_length: 1024`), `512-512`}.
 
 ## Why ablations default to the 55k starter

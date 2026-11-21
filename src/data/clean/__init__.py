@@ -29,6 +29,7 @@ from .dedup import (
     exact_key,
     gold_signature,
     jaccard_index,
+    label_signature,
     shingles,
 )
 from .errors import CleanError, ContestedWriteError, ReportMismatchError
@@ -79,6 +80,7 @@ __all__ = [
     "exact_key",
     "group_key",
     "jaccard_index",
+    "label_signature",
     "q1_short_option",
     "q2_markup_residue",
     "q3_duplicate_option",

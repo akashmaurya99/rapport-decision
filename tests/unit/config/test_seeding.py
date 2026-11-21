@@ -50,6 +50,30 @@ def test_strict_determinism_enables_deterministic_torch():
     torch.use_deterministic_algorithms(False)
 
 
+def test_strict_to_relaxed_restores_relaxed_flags():
+    set_seed(13, determinism="strict")
+    assert torch.are_deterministic_algorithms_enabled()
+    assert torch.backends.cudnn.deterministic is True
+    assert torch.backends.cudnn.benchmark is False
+
+    set_seed(13, determinism="relaxed")
+    assert not torch.are_deterministic_algorithms_enabled()
+    assert torch.backends.cudnn.deterministic is False
+    assert torch.backends.cudnn.benchmark is True
+
+
+def test_relaxed_to_strict_reapplies_strict_flags():
+    set_seed(13, determinism="relaxed")
+    assert not torch.are_deterministic_algorithms_enabled()
+    try:
+        set_seed(13, determinism="strict")
+        assert torch.are_deterministic_algorithms_enabled()
+        assert torch.backends.cudnn.deterministic is True
+        assert torch.backends.cudnn.benchmark is False
+    finally:
+        set_seed(13, determinism="relaxed")
+
+
 def test_out_of_range_seed_fails_typed():
     with pytest.raises(ConfigValueError) as excinfo:
         set_seed(-1)

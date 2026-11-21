@@ -8,11 +8,13 @@ namespace package, ``src.model.core`` (TASK-05) is imported unchanged.
 
 from .errors import (
     AttentionMaskError,
+    DeviceMismatchError,
     GoalMarkerError,
     InvalidOptionCountError,
     InvalidTaskIdError,
     ModelError,
     OptionMaskError,
+    TaskMarkerError,
 )
 from .heads import ConfidenceHead, ProbabilityHead, RiskHead, confidence_features
 from .model import (
@@ -23,7 +25,7 @@ from .model import (
     RapportModel,
     RapportOutput,
 )
-from .readout import MASK_NEG, MarkerReadout, ReadoutOutput
+from .readout import MASK_NEG, MarkerReadout, ReadoutOutput, mask_neg_for
 
 __all__ = [
     "MAX_OPTIONS",
@@ -33,6 +35,7 @@ __all__ = [
     "MASK_NEG",
     "AttentionMaskError",
     "ConfidenceHead",
+    "DeviceMismatchError",
     "GoalMarkerError",
     "InvalidOptionCountError",
     "InvalidTaskIdError",
@@ -44,5 +47,7 @@ __all__ = [
     "RapportOutput",
     "ReadoutOutput",
     "RiskHead",
+    "TaskMarkerError",
     "confidence_features",
+    "mask_neg_for",
 ]

@@ -10,29 +10,37 @@ Deterministic: no wall-clock, no network. Everything printed resolves to the
 input runs' config hashes and data fingerprints.
 
 Exit semantics (consumed by the CLI, e.g. ``scripts/e2e.py --report``):
-:func:`exit_code` returns 1 whenever any *blocking* verdict row is ``fail``, or
-when the negative-results section is empty. :func:`build_report` returns the
-code so callers can ``sys.exit`` with it.
+:func:`exit_code` returns 1 whenever any *blocking* verdict row is anything
+other than ``pass`` — including ``not-measured`` — or when the negative-results
+section is empty. :func:`build_report` returns the code so callers can
+``sys.exit`` with it. A clearly-marked **non-acceptance / starter mode**
+(``build_report(..., starter=True)`` / ``exit_code(..., starter=True)``) tolerates
+``not-measured`` blocking rows and fails only on ``fail``; it is never used by
+the acceptance CLI and is recorded as ``mode: "starter"`` in the report.
 
 Blocking criteria: the pre-registration (docs/evaluation.md §8) declares Y1–Y14
 all pass/fail and names no subset as non-blocking, so all fourteen are treated
 as blocking (fail-closed) — see ``BLOCKING_CRITERIA``.
 
 Missing evidence is never a silent pass: a verdict whose inputs are absent
-renders ``not-measured`` with the missing keys named. Y7 and Y8 additionally
-require the held-out Aegis per-category risk recall at FPR ≤ 0.10 (with the
-keyword-rule comparator) and the XSTest over-refusal rate; either input missing
-→ ``not-measured``, never ``pass``.
+renders ``not-measured`` with the missing keys named, which fails the acceptance
+exit code. Y7 and Y8 additionally require the held-out Aegis per-category risk
+recall measured at FPR ≤ 0.10 with **frozen dev thresholds**, plus Aegis/XSTest
+cohort identity and a fingerprint matching the run's split manifest; generic
+``metrics.risk.*`` payloads are never accepted as evidence. Any missing
+provenance → ``not-measured``, never ``pass``.
 """
 
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
 import math
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, MutableMapping, Sequence
 
 from .ablate import (
     REQUIRED_SEEDS,
@@ -45,7 +53,6 @@ from .ablate import (
 from .baselines import y1_verdict
 from .metrics import (
     DEFAULT_FPR_THRESHOLD,
-    DEFAULT_RISK_FLAG_THRESHOLD,
     RISK_CATEGORIES,
     keyword_risk_baseline,
 )
@@ -187,12 +194,20 @@ def _verdict_row(
 def exit_code(
     rows: Sequence[VerdictRow | Mapping[str, Any]],
     negative_results: Sequence[Any] | None = None,
+    *,
+    starter: bool = False,
 ) -> int:
     """Report command exit code.
 
-    1 when any blocking row is ``fail``, or when ``negative_results`` is given
-    and empty (the mandatory section is empty → the report is invalid);
-    otherwise 0. ``not-measured`` rows do not, by themselves, fail the command.
+    In the default **acceptance** mode, 1 when any blocking row is not exactly
+    ``pass`` (this includes ``not-measured`` — missing evidence is not a pass),
+    or when ``negative_results`` is given and empty (the mandatory section is
+    empty → the report is invalid); otherwise 0.
+
+    ``starter=True`` selects the clearly-marked **non-acceptance / starter**
+    mode: only blocking ``fail`` rows fail; ``not-measured`` rows are tolerated
+    so a partially-instrumented starter run can still produce a report. This
+    mode is never used by the acceptance CLI (:func:`main`).
     """
     code = 0
     for row in rows:
@@ -202,7 +217,13 @@ def exit_code(
         else:
             status = row.status
             blocking = row.blocking
-        if blocking and status == _STATUS_FAIL:
+        if not blocking:
+            continue
+        if starter:
+            fails_on_this_row = status == _STATUS_FAIL
+        else:
+            fails_on_this_row = status != _STATUS_PASS
+        if fails_on_this_row:
             code = 1
             break
     if negative_results is not None and len(negative_results) == 0:
@@ -529,40 +550,50 @@ def _cell_mean(cell: Mapping[str, Any] | None) -> float | None:
     return mean
 
 
-def _scan_recorded_metric(
+def _paired_metric_means(
     metrics: Mapping[str, Any],
-    metric: str,
+    metric_a: str,
+    metric_b: str,
     *,
-    family: str | None = None,
-    preferred_splits: Sequence[str] = ("xstest", "test", "dev"),
-) -> tuple[Mapping[str, Any], str, str] | None:
-    """Find a cell carrying the metric, preferring the named family and splits."""
-    best: tuple[Mapping[str, Any], str, str] | None = None
-    for group, families in metrics.items():
-        if not isinstance(families, Mapping):
+    main_group: str = "main",
+) -> tuple[float, float, float | None] | None:
+    """Find two metrics measured on the *same* cohort and seed stream.
+
+    Both cells must share the exact ``(group, family, split)`` location and have
+    identical ``per_seed`` key sets; otherwise they describe different record
+    streams and may not be compared (e.g. Y5's selective vs full accuracy).
+    """
+    groups = [main_group] + sorted(g for g in metrics if g != main_group)
+    for group in groups:
+        families = _as_mapping(metrics.get(group))
+        if families is None:
             continue
-        for fam, splits in families.items():
-            if family is not None and fam != family:
-                continue
+        for family, splits in families.items():
             if not isinstance(splits, Mapping):
                 continue
             for split, mets in splits.items():
-                if not isinstance(mets, Mapping) or metric not in mets:
+                if not isinstance(mets, Mapping):
                     continue
-                cell = mets[metric]
-                if not isinstance(cell, Mapping):
+                cell_a = _as_mapping(mets.get(metric_a))
+                cell_b = _as_mapping(mets.get(metric_b))
+                if cell_a is None or cell_b is None:
                     continue
-                if best is None:
-                    best = (cell, fam, split)
+                seeds_a = set((_as_mapping(cell_a.get("per_seed")) or {}).keys())
+                seeds_b = set((_as_mapping(cell_b.get("per_seed")) or {}).keys())
+                if not seeds_a or seeds_a != seeds_b:
                     continue
-                _, _, best_split = best
-                def _rank(s: str) -> int:
-                    if s in preferred_splits:
-                        return preferred_splits.index(s)
-                    return len(preferred_splits)
-                if _rank(split) < _rank(best_split):
-                    best = (cell, fam, split)
-    return best
+                mean_a, mean_b = _cell_mean(cell_a), _cell_mean(cell_b)
+                if mean_a is not None and mean_b is not None:
+                    coverage: float | None = None
+                    coverage_cell = _as_mapping(mets.get("selective_actual_coverage"))
+                    if coverage_cell is not None:
+                        recorded = _as_mapping(coverage_cell.get("recorded"))
+                        if recorded is not None:
+                            coverage = _finite_number(recorded.get("80"))
+                        if coverage is None:
+                            coverage = _finite_number(coverage_cell.get("80"))
+                    return mean_a, mean_b, coverage
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -691,8 +722,12 @@ def render_verdict(evidence: Mapping[str, Any]) -> list[VerdictRow]:
     baselines = _as_mapping(evidence.get("baselines")) or {}
     robustness = _as_mapping(evidence.get("robustness")) or {}
     benchmark = _as_mapping(evidence.get("benchmark"))
+    main_group = str(evidence.get("main_group") or "main")
+    run_fingerprints = _fingerprints(evidence.get("runs") or ())
+    expected_fingerprint = run_fingerprints[0] if len(run_fingerprints) == 1 else None
+
     def metric_mean(family: str, split: str, metric: str) -> float | None:
-        cell = _cell(metrics, family, split, metric, group="main")
+        cell = _cell(metrics, family, split, metric, group=main_group)
         if cell is None:
             cell = _cell(metrics, family, split, metric)
         return _cell_mean(cell)
@@ -738,13 +773,43 @@ def render_verdict(evidence: Mapping[str, Any]) -> list[VerdictRow]:
         comparator = _finite_number(evidence.get("y2_comparator_accuracy"))
     if comparator is None:
         comparator = _baseline_ood_accuracy(baselines, "B4")
+    b4_found = _find_baseline(baselines, "B4")
+    b4_entry = b4_found[1] if b4_found is not None else None
+    b4_fingerprint = (
+        b4_entry.get("split_manifest_fingerprint")
+        if isinstance(b4_entry, Mapping) else None
+    )
+    y2_fingerprint = y2_block.get("fingerprint") or evidence.get("y2_fingerprint")
     missing = []
     if ood_acc is None:
         missing.append("robustness.ood.accuracy")
+    ood_source = ood.get("source") or y2_block.get("source")
+    if not isinstance(ood_source, str) or not ood_source.strip():
+        missing.append("robustness.ood.source (named held-out source)")
+    sources = ood.get("sources")
+    if sources != [ood_source]:
+        missing.append("robustness.ood.sources (exactly the named held-out source)")
+    ood_rows = ood.get("n_rows")
+    if type(ood_rows) is not int or ood_rows <= 0:
+        missing.append("robustness.ood.n_rows (positive)")
+    if ood.get("n_train_rows") != 0 or ood.get("n_dev_rows") != 0:
+        missing.append("robustness.ood.n_train_rows/n_dev_rows (both must be zero)")
     if not isinstance(ood_fingerprint, str) or not ood_fingerprint.strip():
         missing.append("robustness.ood.split_manifest_fingerprint")
     if comparator is None:
         missing.append("baselines.B4.ood_accuracy (OOD comparator)")
+    # Fingerprint provenance: the OOD measurement, the run manifest and the B4
+    # comparator must all commit to the same data fingerprint. Previously a
+    # bare fingerprint string was echoed without ever being compared.
+    if expected_fingerprint is None:
+        missing.append("one consistent data fingerprint across runs")
+    else:
+        if isinstance(ood_fingerprint, str) and ood_fingerprint != expected_fingerprint:
+            missing.append("robustness.ood.split_manifest_fingerprint (≠ run fingerprint)")
+        if isinstance(y2_fingerprint, str) and y2_fingerprint != expected_fingerprint:
+            missing.append("evidence.y2.fingerprint (≠ run fingerprint)")
+        if isinstance(b4_fingerprint, str) and b4_fingerprint != expected_fingerprint:
+            missing.append("baselines.B4.split_manifest_fingerprint (≠ run fingerprint)")
     ood_empty = bool(ood.get("empty")) or ood.get("n_rows") == 0
     if ood_empty:
         rows.append(_verdict_row(
@@ -779,31 +844,41 @@ def render_verdict(evidence: Mapping[str, Any]) -> list[VerdictRow]:
             ))
 
     # ---- Y5 — selective accuracy at 80% coverage vs full coverage
-    sel80 = metric_mean("probability", "test", "selective_accuracy_80")
-    if sel80 is None:
-        sel80 = metric_mean("abstention", "test", "selective_accuracy_80")
-    full_acc = metric_mean("probability", "test", "accuracy")
-    if full_acc is None:
-        full_acc = metric_mean("abstention", "test", "accuracy")
-    if full_acc is None:
-        full_acc = metric_mean("choice", "test", "accuracy")
+    # The two numbers must come from the SAME cohort: same group, family, split
+    # and identical seed/record stream. Mixing e.g. an abstention-family
+    # selective accuracy with a choice-family full accuracy is not a valid
+    # comparison and renders not-measured.
+    pair = _paired_metric_means(
+        metrics, "selective_accuracy_80", "accuracy", main_group=main_group
+    )
     missing = []
-    if sel80 is None:
-        missing.append("metrics.probability.test.selective_accuracy_80")
-    if full_acc is None:
-        missing.append("metrics.probability.test.accuracy (full coverage)")
+    if pair is None:
+        missing.append("metrics.<group>.<family>.<split>.selective_accuracy_80 and "
+                       "accuracy from one matching cohort")
+    fingerprints = _fingerprints(evidence.get("runs") or ())
+    if fingerprints and len(fingerprints) != 1:
+        missing.append("one consistent data fingerprint across compared runs")
     if missing:
         rows.append(_verdict_row("Y5", _STATUS_NOT_MEASURED,
                                  "missing: " + ", ".join(missing), missing))
     else:
-        assert sel80 is not None and full_acc is not None
-        gap_points = (sel80 - full_acc) * _POINTS_PER_UNIT
-        rows.append(_verdict_row(
-            "Y5",
-            _STATUS_PASS if gap_points >= _Y5_MIN_GAIN_POINTS - _EPS else _STATUS_FAIL,
-            f"selective accuracy @80% coverage − full coverage = {gap_points:+.2f} points "
-            f"(margin +5.00; sel80={sel80:.4f}, full={full_acc:.4f})",
-        ))
+        assert pair is not None
+        sel80, full_acc, actual_coverage = pair
+        if actual_coverage is None or abs(actual_coverage - 0.80) > 1e-6:
+            rows.append(_verdict_row(
+                "Y5", _STATUS_NOT_MEASURED,
+                "the matched cohort did not realize exactly 80% coverage "
+                f"(actual={actual_coverage})",
+                ["metrics.<group>.<family>.<split>.selective_actual_coverage.80"],
+            ))
+        else:
+            gap_points = (sel80 - full_acc) * _POINTS_PER_UNIT
+            rows.append(_verdict_row(
+                "Y5",
+                _STATUS_PASS if gap_points >= _Y5_MIN_GAIN_POINTS - _EPS else _STATUS_FAIL,
+                f"selective accuracy @80% coverage − full coverage = {gap_points:+.2f} points "
+                f"(margin +5.00; sel80={sel80:.4f}, full={full_acc:.4f}; matched cohort)",
+            ))
 
     # ---- Y6 — permutation invariance (from the robustness report)
     permutation = _as_mapping(robustness.get("permutation")) or {}
@@ -845,50 +920,67 @@ def render_verdict(evidence: Mapping[str, Any]) -> list[VerdictRow]:
             f"|Δaccuracy| = {acc_delta * _POINTS_PER_UNIT:.3f} points (limit 0.5)",
         ))
 
-    # ---- Y7 — per-category risk recall at FPR ≤ 0.10 (Aegis held-out) + keyword comparator
+    # ---- Y7 — per-category risk recall at FPR ≤ 0.10 (Aegis held-out)
+    # Evidence MUST be a typed Aegis cohort block with provenance: cohort
+    # identity, a split-manifest fingerprint matching the run, frozen dev
+    # thresholds and per-category confusion counts with a measured FPR. Generic
+    # ``metrics.risk.test.risk_recall_at_fpr`` (threshold-searched on the very
+    # rows being evaluated) is never accepted — it is an oracle diagnostic, not
+    # evidence.
     y7_block = _as_mapping(evidence.get("y7")) or {}
-    aegis = _first_mapping(
-        y7_block.get("aegis_risk_recall_at_fpr"),
-        y7_block.get("risk_recall_at_fpr"),
-        evidence.get("aegis_risk_recall_at_fpr"),
-        evidence.get("risk_recall_at_fpr"),
+    missing = _frozen_risk_provenance_errors(
+        y7_block, expected_fingerprint, cohort="aegis", label="evidence.y7"
     )
-    recall_source = "evidence"
-    if aegis is None:
-        found = _scan_recorded_metric(metrics, "risk_recall_at_fpr", family="risk")
-        if found is not None:
-            cell, fam, split = found
-            recorded = cell.get("recorded")
-            if isinstance(recorded, Mapping):
-                aegis = recorded
-                recall_source = f"metrics.{fam}.{split}.risk_recall_at_fpr"
     fpr_threshold = _finite_number(y7_block.get("fpr_threshold"))
     if fpr_threshold is None:
-        fpr_threshold = _finite_number(evidence.get("risk_fpr_threshold"))
+        fpr_threshold = DEFAULT_FPR_THRESHOLD
+    if fpr_threshold > DEFAULT_FPR_THRESHOLD + _EPS:
+        missing.append("fpr_threshold (recall must be measured at FPR <= 0.10)")
     keyword = _keyword_comparator(y7_block, evidence)
-    missing = []
-    if aegis is None:
-        missing.append(
-            "evidence.aegis_risk_recall_at_fpr "
-            "(per-category recall at FPR <= 0.10, held-out Aegis rows)"
-        )
     if keyword is None:
-        missing.append("evidence.keyword_risk_baseline (keyword-rule comparator)")
-    if fpr_threshold is not None and fpr_threshold > DEFAULT_FPR_THRESHOLD + _EPS:
-        missing.append(
-            f"fpr_threshold (>{DEFAULT_FPR_THRESHOLD}); "
-            "recall must be measured at FPR <= 0.10"
-        )
-        aegis = None
+        missing.append("evidence.y7.keyword_risk_baseline (keyword-rule comparator)")
+    else:
+        keyword_recalls_raw = keyword.get("recall")
+        if not isinstance(keyword_recalls_raw, Mapping):
+            missing.append("evidence.y7.keyword_risk_baseline.recall")
+        else:
+            for category in RISK_CATEGORIES:
+                value = _finite_number(keyword_recalls_raw.get(category))
+                if value is None or not 0.0 <= value <= 1.0:
+                    missing.append(f"evidence.y7.keyword_risk_baseline.recall.{category}")
+    measurements = _as_mapping(y7_block.get("measurements")) or {}
     model_recalls: dict[str, float] = {}
-    if aegis is not None:
-        for category in RISK_CATEGORIES:
-            value = _finite_number(aegis.get(category))
-            if value is not None:
-                model_recalls[category] = value
-        absent = [c for c in RISK_CATEGORIES if c not in model_recalls]
-        if absent:
-            missing.append(f"aegis recall for categories: {', '.join(absent)}")
+    for category in RISK_CATEGORIES:
+        m = _as_mapping(measurements.get(category))
+        if m is None:
+            missing.append(f"evidence.y7.measurements.{category}")
+            continue
+        counts = [m.get(key) for key in ("tp", "fp", "fn", "tn")]
+        if any(type(value) is not int or value < 0 for value in counts):
+            missing.append(f"evidence.y7.measurements.{category}.counts (nonnegative integers)")
+            continue
+        tp, fp, fn, tn = (value for value in counts if type(value) is int)
+        recall, measured_fpr = _finite_number(m.get("recall")), _finite_number(m.get("fpr"))
+        if recall is None or measured_fpr is None:
+            missing.append(f"evidence.y7.measurements.{category}.recall/fpr")
+            continue
+        if not (0.0 <= recall <= 1.0 and 0.0 <= measured_fpr <= 1.0):
+            missing.append(f"evidence.y7.measurements.{category}.recall/fpr (outside [0,1])")
+            continue
+        if tp + fn <= 0 or fp + tn <= 0:
+            missing.append(
+                f"evidence.y7.measurements.{category} (positive and negative cohorts required)"
+            )
+            continue
+        expected_recall = tp / (tp + fn)
+        expected_fpr = fp / (fp + tn)
+        if abs(recall - expected_recall) > 1e-6:
+            missing.append(f"evidence.y7.measurements.{category}.recall (inconsistent with TP/FN)")
+        if abs(measured_fpr - expected_fpr) > 1e-6:
+            missing.append(f"evidence.y7.measurements.{category}.fpr (inconsistent with FP/TN)")
+        if measured_fpr > DEFAULT_FPR_THRESHOLD + _EPS:
+            missing.append(f"evidence.y7.measurements.{category}.fpr (> 0.10)")
+        model_recalls[category] = recall
     if missing:
         rows.append(_verdict_row("Y7", _STATUS_NOT_MEASURED,
                                  "missing: " + ", ".join(missing), missing))
@@ -906,73 +998,95 @@ def render_verdict(evidence: Mapping[str, Any]) -> list[VerdictRow]:
         keyword_text = f"{keyword_min:.4f}" if keyword_min is not None else "n/a"
         rows.append(_verdict_row(
             "Y7", status,
-            f"min per-category recall at FPR<=0.10 = {weakest:.4f} ({weakest_cat}); "
-            f"keyword-rule comparator min recall = {keyword_text}; "
-            f"threshold >= 0.85; source={recall_source}",
+            f"min per-category recall at measured FPR<=0.10 = {weakest:.4f} ({weakest_cat}); "
+            f"keyword-rule comparator min recall = {keyword_text}; threshold >= 0.85; "
+            f"cohort=aegis, fingerprint={expected_fingerprint}, "
+            "thresholds=frozen-dev",
         ))
 
     # ---- Y8 — over-refusal rate on the XSTest safe set
+    # Requires a typed XSTest cohort block with the same frozen-dev-threshold
+    # provenance; no generic metrics fallback.
     y8_block = _as_mapping(evidence.get("y8")) or {}
+    missing = _frozen_risk_provenance_errors(
+        y8_block, expected_fingerprint, cohort="xstest", label="evidence.y8"
+    )
+    y7_tfp = y7_block.get("risk_thresholds_fingerprint")
+    y8_tfp = y8_block.get("risk_thresholds_fingerprint")
+    if isinstance(y7_tfp, str) and isinstance(y8_tfp, str) and y7_tfp != y8_tfp:
+        missing.append("evidence.y8.risk_thresholds_fingerprint (differs from y7)")
     over_refusal = _finite_number(y8_block.get("xstest_over_refusal_rate"))
     if over_refusal is None:
         over_refusal = _finite_number(y8_block.get("over_refusal_rate"))
-    if over_refusal is None:
-        over_refusal = _finite_number(evidence.get("xstest_over_refusal_rate"))
-    rate_source = "evidence"
-    if over_refusal is None:
-        found = _scan_recorded_metric(
-            metrics, "over_refusal_rate", family="risk",
-            preferred_splits=("xstest", "test", "dev"),
-        )
-        if found is not None:
-            cell, fam, split = found
-            mean = _finite_number(cell.get("mean"))
-            if mean is None:
-                mean = _finite_number(cell.get("recorded"))
-            if mean is not None:
-                over_refusal = mean
-                rate_source = f"metrics.{fam}.{split}.over_refusal_rate"
+    n_safe = y8_block.get("n_safe")
+    n_flagged = y8_block.get("n_flagged")
+    if type(n_safe) is not int or n_safe <= 0:
+        missing.append("evidence.y8.n_safe (positive safe-cohort size)")
+    if type(n_flagged) is not int or n_flagged < 0:
+        missing.append("evidence.y8.n_flagged (nonnegative integer)")
+    if type(n_safe) is int and type(n_flagged) is int and n_safe > 0:
+        if n_flagged > n_safe:
+            missing.append("evidence.y8.n_flagged (cannot exceed n_safe)")
+        elif over_refusal is not None and abs(over_refusal - n_flagged / n_safe) > 1e-6:
+            missing.append("evidence.y8.xstest_over_refusal_rate (inconsistent with counts)")
     if over_refusal is None or not 0.0 <= over_refusal <= 1.0:
-        missing = ["evidence.xstest_over_refusal_rate (over-refusal rate on the XSTest safe set)"]
+        missing.append("evidence.y8.xstest_over_refusal_rate (XSTest safe set, frozen thresholds)")
+    if missing:
         rows.append(_verdict_row("Y8", _STATUS_NOT_MEASURED,
                                  "missing: " + ", ".join(missing), missing))
     else:
+        assert over_refusal is not None
         rows.append(_verdict_row(
             "Y8",
             _STATUS_PASS if over_refusal <= 0.10 + _EPS else _STATUS_FAIL,
             f"over-refusal rate on XSTest safe set = {over_refusal:.4f} "
-            f"(limit 0.10; flag threshold {DEFAULT_RISK_FLAG_THRESHOLD}, "
-            f"frozen); source={rate_source}",
+            f"(limit 0.10; frozen dev thresholds); cohort=xstest, "
+            f"fingerprint={expected_fingerprint}",
         ))
 
     # ---- Y9 — p50 batch-1 latency (T4 FP16)
-    p50 = _dig(benchmark, [["p50_batch1_ms"], ["p50_batch_1_ms"], ["batch1_p50_ms"],
-                           ["p50_latency_batch1_ms"], ["batch1", "p50_ms"],
-                           ["latency", "batch1", "p50_ms"], ["latency_ms", "p50_batch1"]])
+    p50 = _fp16_measurement(benchmark or {}, 1, "p50_ms", "p50_batch1_ms")
     if p50 is None:
+        p50 = _dig(benchmark, [["p50_batch1_ms"], ["p50_batch_1_ms"], ["batch1_p50_ms"],
+                               ["p50_latency_batch1_ms"], ["batch1", "p50_ms"],
+                               ["latency", "batch1", "p50_ms"], ["latency_ms", "p50_batch1"]])
+    y9_missing = _benchmark_provenance_errors(benchmark or {}, required_batches=(1,))
+    if p50 is None or p50 <= 0.0:
+        y9_missing.append("benchmark.measurements.fp16.1.p50_ms (positive finite)")
+    if y9_missing:
         rows.append(_verdict_row("Y9", _STATUS_NOT_MEASURED,
-                                 "missing: benchmark.p50_batch1_ms",
-                                 ["benchmark.p50_batch1_ms"]))
+                                 "missing: " + ", ".join(y9_missing), y9_missing))
     else:
+        assert p50 is not None
         rows.append(_verdict_row(
             "Y9", _STATUS_PASS if p50 <= _Y9_MAX_P50_MS + _EPS else _STATUS_FAIL,
-            f"p50 batch-1 latency = {p50:.3f} ms (limit {_Y9_MAX_P50_MS} ms)",
+            f"p50 batch-1 latency = {p50:.3f} ms (limit {_Y9_MAX_P50_MS} ms; "
+            "T4 FP16, batch 1, synchronized timing)",
         ))
 
     # ---- Y10 — throughput at batch 32
-    throughput = _dig(benchmark, [["throughput_batch32"], ["throughput_batch_32"],
-                                  ["decisions_per_second_batch32"], ["batch32_throughput"],
-                                  ["batch32", "throughput"], ["batch32", "decisions_per_second"],
-                                  ["throughput", "batch32"]])
+    throughput = _fp16_measurement(
+        benchmark or {}, 32, "throughput_decisions_per_s", "throughput_batch32"
+    )
     if throughput is None:
+        throughput = _dig(benchmark, [["throughput_batch32"], ["throughput_batch_32"],
+                                      ["decisions_per_second_batch32"], ["batch32_throughput"],
+                                      ["batch32", "throughput"],
+                                      ["batch32", "decisions_per_second"],
+                                      ["throughput", "batch32"]])
+    y10_missing = _benchmark_provenance_errors(benchmark or {}, required_batches=(32,))
+    if throughput is None or throughput < 0.0:
+        y10_missing.append("benchmark.measurements.fp16.32.throughput_decisions_per_s")
+    if y10_missing:
         rows.append(_verdict_row("Y10", _STATUS_NOT_MEASURED,
-                                 "missing: benchmark.throughput_batch32",
-                                 ["benchmark.throughput_batch32"]))
+                                 "missing: " + ", ".join(y10_missing), y10_missing))
     else:
+        assert throughput is not None
         rows.append(_verdict_row(
             "Y10",
             _STATUS_PASS if throughput >= _Y10_MIN_THROUGHPUT - _EPS else _STATUS_FAIL,
-            f"batch-32 throughput = {throughput:.1f} decisions/s (limit {_Y10_MIN_THROUGHPUT})",
+            f"batch-32 throughput = {throughput:.1f} decisions/s "
+            f"(limit {_Y10_MIN_THROUGHPUT}; T4 FP16, batch 32, synchronized timing)",
         ))
 
     # ---- Y11 — parameters / FP32 size
@@ -984,10 +1098,10 @@ def render_verdict(evidence: Mapping[str, Any]) -> list[VerdictRow]:
     if fp32 is None:
         fp32 = _finite_number(evidence.get("fp32_size_bytes"))
     missing = []
-    if params is None:
-        missing.append("benchmark.parameters")
-    if fp32 is None:
-        missing.append("benchmark.fp32_size_bytes")
+    if params is None or type(params) is bool or params <= 0 or params != int(params):
+        missing.append("benchmark.parameters (positive integer)")
+    if fp32 is None or fp32 <= 0:
+        missing.append("benchmark.fp32_size_bytes (positive)")
     if missing:
         rows.append(_verdict_row("Y11", _STATUS_NOT_MEASURED,
                                  "missing: " + ", ".join(missing), missing))
@@ -1000,33 +1114,40 @@ def render_verdict(evidence: Mapping[str, Any]) -> list[VerdictRow]:
             f"FP32 size = {fp32 / (1024 * 1024):.1f} MB (limit 140 MB)",
         ))
 
-    # ---- Y12 — INT8 export accuracy drop (or artifact rejected)
+    # ---- Y12 — INT8 export accuracy drop (or a real gate rejection)
     int8_block = benchmark.get("int8") if benchmark else None
     int8_export = _as_mapping(evidence.get("int8_export")) or _as_mapping(int8_block) or {}
-    rejected = bool(int8_export.get("artifact_rejected")) or bool(
-        evidence.get("int8_artifact_rejected")
-    )
-    drop = _finite_number(evidence.get("int8_accuracy_drop_points"))
+    gate_missing, gate_passed = _validate_int8_gate(int8_export)
+    drop = _finite_number(int8_export.get("accuracy_drop_points"))
     if drop is None:
-        drop = _finite_number(evidence.get("int8_accuracy_drop"))
-    if drop is None:
-        drop = _finite_number(int8_export.get("accuracy_drop_points"))
+        drop = _finite_number(evidence.get("int8_accuracy_drop_points"))
     if drop is None:
         drop = _finite_number(int8_export.get("accuracy_drop"))
-    if rejected:
+    if gate_missing:
+        rows.append(_verdict_row("Y12", _STATUS_NOT_MEASURED,
+                                 "missing: " + ", ".join(gate_missing), gate_missing))
+    elif gate_passed is False:
+        # A real gate rejection (a failed condition + validated FP16 retention)
+        # makes the accuracy-drop criterion inapplicable — but a bare boolean
+        # never passes.
         rows.append(_verdict_row(
             "Y12", _STATUS_PASS,
-            "INT8 artifact rejected on export; accuracy-drop criterion not applicable",
+            "INT8 artifact refused by the quantization gate "
+            f"(retained={int8_export.get('retained_artifact')}); "
+            "accuracy-drop criterion not applicable",
         ))
     elif drop is None:
-        rows.append(_verdict_row("Y12", _STATUS_NOT_MEASURED,
-                                 "missing: evidence.int8_accuracy_drop_points",
-                                 ["evidence.int8_accuracy_drop_points"]))
+        rows.append(_verdict_row(
+            "Y12", _STATUS_NOT_MEASURED,
+            "missing: int8_export.accuracy_drop_points (gate accepted INT8)",
+            ["int8_export.accuracy_drop_points"],
+        ))
     else:
         rows.append(_verdict_row(
             "Y12",
             _STATUS_PASS if drop <= _Y12_MAX_DROP_POINTS + _EPS else _STATUS_FAIL,
-            f"INT8 accuracy drop = {drop:.2f} points (limit {_Y12_MAX_DROP_POINTS})",
+            f"INT8 accuracy drop = {drop:.2f} points (limit {_Y12_MAX_DROP_POINTS}; "
+            "gate accepted INT8, validated artifact retained)",
         ))
 
     # ---- Y13 — resume after simulated kill
@@ -1034,30 +1155,61 @@ def render_verdict(evidence: Mapping[str, Any]) -> list[VerdictRow]:
     abs_diff = _finite_number(resume.get("abs_diff"))
     if abs_diff is None:
         abs_diff = _finite_number(evidence.get("resume_abs_diff"))
-    resume_passed = resume.get("passed") if isinstance(resume.get("passed"), bool) else None
-    if abs_diff is not None:
+    resumed_step = resume.get("resumed_step")
+    resumed_from = resume.get("resumed_from")
+    next_step = resume.get("next_step")
+    if abs_diff is None:
+        rows.append(_verdict_row("Y13", _STATUS_NOT_MEASURED,
+                                 "missing: evidence.resume.abs_diff",
+                                 ["evidence.resume.abs_diff"]))
+    elif (
+        not isinstance(resumed_from, str)
+        or not resumed_from.strip()
+        or type(resumed_step) is not int
+        or resumed_step < 1
+        or next_step != resumed_step + 1
+    ):
+        rows.append(_verdict_row(
+            "Y13", _STATUS_NOT_MEASURED,
+            "missing resume provenance: resumed_from, positive resumed_step and next_step",
+            ["evidence.resume.resumed_from", "evidence.resume.resumed_step",
+             "evidence.resume.next_step"],
+        ))
+    else:
         rows.append(_verdict_row(
             "Y13",
             _STATUS_PASS if abs_diff <= _Y13_MAX_ABS_DIFF + _EPS else _STATUS_FAIL,
             f"next-step |loss − reference| = {abs_diff:.3e} (limit {_Y13_MAX_ABS_DIFF:.0e})",
         ))
-    elif resume_passed is not None:
-        rows.append(_verdict_row(
-            "Y13", _STATUS_PASS if resume_passed else _STATUS_FAIL,
-            f"resume check recorded passed={resume_passed}",
-        ))
-    else:
-        rows.append(_verdict_row("Y13", _STATUS_NOT_MEASURED,
-                                 "missing: evidence.resume.abs_diff",
-                                 ["evidence.resume.abs_diff"]))
 
     # ---- Y14 — reproducibility: two runs of one seed within 0.5 accuracy points
-    delta = _finite_number(evidence.get("reproducibility_delta_points"))
-    if delta is None:
-        repro = _as_mapping(evidence.get("reproducibility")) or {}
-        delta = _finite_number(repro.get("delta_points"))
+    repro = _as_mapping(evidence.get("reproducibility"))
+    delta: float | None = None
     delta_source = "evidence"
-    if delta is None:
+    if repro is not None:
+        run_ids = repro.get("run_ids")
+        seed = _finite_number(repro.get("seed"))
+        candidate = _finite_number(repro.get("delta_points"))
+        if (
+            not isinstance(run_ids, (list, tuple))
+            or len(run_ids) != 2
+            or len(set(run_ids)) != 2
+            or seed is None
+            or candidate is None
+            or candidate < 0.0
+            or not isinstance(repro.get("config_hash"), str)
+            or not isinstance(repro.get("data_fingerprint"), str)
+            or not isinstance(repro.get("metric"), str)
+        ):
+            rows.append(_verdict_row(
+                "Y14", _STATUS_NOT_MEASURED,
+                "invalid evidence.reproducibility (two distinct run_ids, seed, config/data "
+                "identity, metric and nonnegative delta are required)",
+                ["evidence.reproducibility"],
+            ))
+            return rows
+        delta = candidate
+    else:
         measured = _duplicate_seed_delta_points(metrics)
         if measured is not None:
             delta = measured
@@ -1078,6 +1230,172 @@ def render_verdict(evidence: Mapping[str, Any]) -> list[VerdictRow]:
         ))
 
     return rows
+
+
+_INT8_GATE_CONDITIONS: tuple[str, ...] = (
+    "choice_accuracy_drop",
+    "bucket_macro_ece_rise",
+    "cosine_score_path_fp32",
+    "serialized_size",
+    "p95_latency_speedup",
+)
+
+
+def _validate_int8_gate(block: Mapping[str, Any]) -> tuple[list[str], bool | None]:
+    """Check that a real quantization-gate outcome and retained artifact exist.
+
+    Returns ``(missing, passed)``. A bare ``artifact_rejected`` boolean is never
+    sufficient — the gate outcome (with its five conditions) and the validated
+    retained FP16/INT8 artifact are required.
+    """
+    missing: list[str] = []
+    gate = _as_mapping(block.get("gate_outcome"))
+    if gate is None:
+        return (["int8_export.gate_outcome (real quantization-gate outcome)"], None)
+    passed = gate.get("passed")
+    artifact = gate.get("artifact")
+    conditions = _as_mapping(gate.get("conditions"))
+    if not isinstance(passed, bool):
+        missing.append("int8_export.gate_outcome.passed")
+    if artifact not in ("int8", "fp16"):
+        missing.append("int8_export.gate_outcome.artifact")
+    if conditions is None:
+        missing.append("int8_export.gate_outcome.conditions")
+    else:
+        absent = [c for c in _INT8_GATE_CONDITIONS if not isinstance(conditions.get(c), bool)]
+        if absent:
+            missing.append("int8_export.gate_outcome.conditions." + ", ".join(absent))
+        elif isinstance(passed, bool):
+            if all(conditions[c] for c in _INT8_GATE_CONDITIONS) != passed:
+                missing.append("int8_export.gate_outcome.passed (inconsistent with conditions)")
+    if passed is True and artifact != "int8":
+        missing.append("int8_export.gate_outcome.artifact (accepted gate must retain INT8)")
+    if passed is False and artifact != "fp16":
+        missing.append("int8_export.gate_outcome.artifact (rejected gate must retain FP16)")
+    retained = block.get("retained_artifact")
+    if retained not in ("int8", "fp16"):
+        missing.append("int8_export.retained_artifact")
+    elif artifact in ("int8", "fp16") and retained != artifact:
+        missing.append("int8_export.retained_artifact (must match gate artifact)")
+    validated = _as_mapping(block.get("validated_artifacts"))
+    retained_entry = (
+        _as_mapping(validated.get(retained))
+        if validated is not None and isinstance(retained, str)
+        else None
+    )
+    if retained_entry is None:
+        missing.append(f"int8_export.validated_artifacts.{retained}")
+    else:
+        size = _finite_number(retained_entry.get("size_bytes"))
+        path = retained_entry.get("path")
+        if size is None or size <= 0:
+            missing.append(f"int8_export.validated_artifacts.{retained}.size_bytes")
+        if not isinstance(path, str) or not path.strip():
+            missing.append(f"int8_export.validated_artifacts.{retained}.path")
+        for proof in ("onnx_checker", "ort_session", "parity_validated"):
+            if retained_entry.get(proof) is not True:
+                missing.append(f"int8_export.validated_artifacts.{retained}.{proof}")
+        fingerprint = retained_entry.get("sha256")
+        if not isinstance(fingerprint, str) or len(fingerprint) != 64:
+            missing.append(f"int8_export.validated_artifacts.{retained}.sha256")
+    return missing, (passed if isinstance(passed, bool) else None)
+
+
+def _fp16_measurement(
+    benchmark: Mapping[str, Any], batch: int, *keys: str
+) -> float | None:
+    """Read a scalar specifically from the FP16 batch measurement, if present."""
+    measurements = _as_mapping(benchmark.get("measurements"))
+    fp16 = _as_mapping(measurements.get("fp16")) if measurements is not None else None
+    entry = _as_mapping(fp16.get(str(batch))) if fp16 is not None else None
+    if entry is None:
+        return None
+    for key in keys:
+        value = _finite_number(entry.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _benchmark_provenance_errors(
+    benchmark: Mapping[str, Any], *, required_batches: Sequence[int]
+) -> list[str]:
+    """Y9/Y10 measurement conditions: T4 device, FP16, batch, synced timing."""
+    missing: list[str] = []
+    device = str(benchmark.get("device") or "").strip().lower()
+    if (
+        device not in {"t4", "nvidia t4", "nvidia tesla t4"}
+        or "emulat" in device
+        or "cpu" in device
+    ):
+        missing.append("benchmark.device (exact NVIDIA T4 required)")
+    precision = benchmark.get("precision")
+    if not isinstance(precision, str) or precision.strip().lower() != "fp16":
+        missing.append("benchmark.precision (the measured precision must be fp16)")
+    synchronized = benchmark.get("latency_synchronized")
+    timing = str(
+        benchmark.get("latency_method") or benchmark.get("timing_method") or ""
+    ).strip().lower().replace(" ", "-").replace("_", "-")
+    valid_method = timing in {
+        "synchronized",
+        "synchronized-cuda-events",
+        "cuda-events-synchronized",
+        "cuda-event-synchronized",
+    }
+    if synchronized is not True and not valid_method:
+        missing.append("benchmark.latency_synchronized (explicit synchronized timing required)")
+    if "unsync" in timing or "not-" in timing or "emulat" in timing:
+        missing.append("benchmark.latency_method (negated/emulated timing is not evidence)")
+    batch_value = benchmark.get("batch")
+    batches = (
+        [b for b in batch_value if isinstance(b, int) and not isinstance(b, bool)]
+        if isinstance(batch_value, (list, tuple)) else []
+    )
+    for size in required_batches:
+        if size not in batches:
+            missing.append(f"benchmark.batch (must include {size})")
+    return missing
+
+
+def _frozen_risk_provenance_errors(
+    block: Mapping[str, Any],
+    expected_fingerprint: str | None,
+    *,
+    cohort: str,
+    label: str,
+) -> list[str]:
+    """Missing/tampered provenance for a frozen-threshold risk measurement.
+
+    Y7 (Aegis) and Y8 (XSTest) may only pass on a typed cohort block carrying:
+    the right ``cohort``, a split-manifest fingerprint matching the runs, an
+    explicit ``thresholds_from='dev'`` marker and a non-empty
+    ``risk_thresholds_fingerprint`` identifying the frozen dev thresholds.
+    """
+    missing: list[str] = []
+    if str(block.get("cohort", "")).strip().lower() != cohort:
+        missing.append(f"{label}.cohort (must be '{cohort}')")
+    supplied_fp = block.get("split_manifest_fingerprint")
+    if not isinstance(supplied_fp, str) or not supplied_fp.strip():
+        missing.append(f"{label}.split_manifest_fingerprint")
+    elif expected_fingerprint is None or supplied_fp != expected_fingerprint:
+        missing.append(f"{label}.split_manifest_fingerprint (must match the run fingerprint)")
+    if str(block.get("thresholds_from", "")).strip().lower() != "dev":
+        missing.append(f"{label}.thresholds_from (must be 'dev' — frozen before test)")
+    tfp = block.get("risk_thresholds_fingerprint")
+    if not isinstance(tfp, str) or len(tfp) != 64 or any(
+        char not in "0123456789abcdef" for char in tfp
+    ):
+        missing.append(f"{label}.risk_thresholds_fingerprint (64-hex digest required)")
+    thresholds = block.get("risk_thresholds")
+    if thresholds is not None:
+        if not isinstance(thresholds, Mapping):
+            missing.append(f"{label}.risk_thresholds (must be a mapping)")
+        elif isinstance(tfp, str):
+            canonical = json.dumps(thresholds, sort_keys=True, default=str, separators=(",", ":"))
+            actual = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+            if actual != tfp:
+                missing.append(f"{label}.risk_thresholds_fingerprint (does not match payload)")
+    return missing
 
 
 def _first_mapping(*candidates: Any) -> Mapping[str, Any] | None:
@@ -1151,24 +1469,40 @@ def _keyword_comparator(
     return None
 
 
-def _duplicate_seed_delta_points(metrics: Mapping[str, Any]) -> float | None:
+def _duplicate_seed_delta_points(
+    metrics: Mapping[str, Any],
+    *,
+    family: str = "choice",
+    split: str = "test",
+    metric: str = "accuracy",
+) -> float | None:
+    """Max pairwise accuracy gap across repeated runs of one seed.
+
+    Y14 is an *accuracy reproducibility* criterion: only the declared accuracy
+    metric on the declared cohort is inspected (an NLL-only difference is not a
+    reproducibility failure). A measured zero gap — exact duplicate runs — is
+    preserved as ``0.0`` (a genuine measurement, not "not-measured").
+    """
     best: float | None = None
     for families in metrics.values():
         if not isinstance(families, Mapping):
             continue
-        for splits in families.values():
-            if not isinstance(splits, Mapping):
-                continue
-            for mets in splits.values():
-                if not isinstance(mets, Mapping):
-                    continue
-                for cell in mets.values():
-                    if not isinstance(cell, Mapping):
-                        continue
-                    gap = _finite_number(cell.get("duplicate_seed_max_gap_points"))
-                    if gap is None or gap <= 0.0:
-                        continue
-                    best = gap if best is None else max(best, gap)
+        fam = _as_mapping(families.get(family))
+        if fam is None:
+            continue
+        sp = _as_mapping(fam.get(split))
+        if sp is None:
+            continue
+        cell = _as_mapping(sp.get(metric))
+        if cell is None:
+            continue
+        counts = _as_mapping(cell.get("per_seed_counts")) or {}
+        if not any((_finite_number(v) or 0) > 1 for v in counts.values()):
+            continue  # no repeated seed on this cohort
+        gap = _finite_number(cell.get("duplicate_seed_max_gap_points"))
+        if gap is None:
+            gap = 0.0  # duplicate seeds measured but exactly identical
+        best = gap if best is None else max(best, gap)
     return best
 
 
@@ -1294,14 +1628,165 @@ def _manifest_block(
     }
 
 
+def _aggregate_robustness_blocks(
+    blocks: Sequence[Mapping[str, Any]], warnings: list[str]
+) -> dict[str, Any]:
+    """Collapse per-seed robustness blocks into one conservative verdict view.
+
+    The worst measured value across seeds wins — a later seed that fails is
+    never hidden by an earlier passing block. Where seeds disagree on the
+    split fingerprint the fingerprint is voided (→ not-measured, fail-closed).
+    """
+    base = dict(blocks[0])
+    perms: list[Mapping[str, Any]] = []
+    for block in blocks:
+        perm = _as_mapping(block.get("permutation"))
+        if perm is not None:
+            perms.append(perm)
+    overall: list[Mapping[str, Any]] = []
+    for perm in perms:
+        entry = _as_mapping(perm.get("overall"))
+        if entry is not None:
+            overall.append(entry)
+    if overall:
+        withins = [
+            o.get("within_tolerance") for o in overall
+            if isinstance(o.get("within_tolerance"), bool)
+        ]
+        deltas = [
+            d for d in (_finite_number(o.get("accuracy_delta")) for o in overall)
+            if d is not None
+        ]
+        deviations = [
+            d for d in (_finite_number(o.get("score_max_deviation")) for o in overall)
+            if d is not None
+        ]
+        merged = dict(overall[0])
+        if withins:
+            merged["within_tolerance"] = all(withins)
+            if not all(withins):
+                warnings.append("permutation within_tolerance failed on at least one seed")
+        if deltas:
+            merged["accuracy_delta"] = max(deltas)
+        if deviations:
+            merged["score_max_deviation"] = max(deviations)
+        base["permutation"] = {**perms[0], "overall": merged}
+    oods: list[Mapping[str, Any]] = []
+    for block in blocks:
+        ood_block = _as_mapping(block.get("ood"))
+        if ood_block is not None:
+            oods.append(ood_block)
+    if oods:
+        accuracies = [
+            a for a in (_finite_number(o.get("accuracy")) for o in oods) if a is not None
+        ]
+        fps = {
+            o.get("split_manifest_fingerprint") for o in oods
+            if isinstance(o.get("split_manifest_fingerprint"), str)
+        }
+        merged_ood = dict(oods[0])
+        if accuracies:
+            merged_ood["accuracy"] = min(accuracies)  # worst held-out accuracy
+        merged_ood["empty"] = any(bool(o.get("empty")) for o in oods)
+        if len(fps) > 1:
+            warnings.append("OOD split-manifest fingerprints disagree across seeds; voided")
+            merged_ood["split_manifest_fingerprint"] = None
+        base["ood"] = merged_ood
+    return base
+
+
+def _aggregate_benchmark_blocks(
+    blocks: Sequence[Mapping[str, Any]], warnings: list[str]
+) -> dict[str, Any]:
+    """Collapse per-seed benchmarks: worst latency/size, best throughput."""
+    base = dict(blocks[0])
+    for key, mode in (
+        ("p50_batch1_ms", "max"), ("p95_batch1_ms", "max"),
+        ("p99_batch1_ms", "max"), ("throughput_batch32", "min"),
+        ("parameters", "max"), ("fp32_size_bytes", "max"),
+    ):
+        values = [v for v in (_finite_number(b.get(key)) for b in blocks) if v is not None]
+        if values:
+            base[key] = max(values) if mode == "max" else min(values)
+    for key in ("device", "precision", "latency_method", "timing_method"):
+        distinct = {str(b.get(key)) for b in blocks}
+        if len(distinct) > 1:
+            warnings.append(f"benchmark.{key} disagrees across seeds; voided")
+            base[key] = None
+    return base
+
+
+def _aggregate_evidence_blocks(
+    merged: dict[str, Any], blocks: Sequence[Mapping[str, Any]], warnings: list[str]
+) -> None:
+    """Never let a later passing seed hide an earlier failing evidence value."""
+
+    def _worst(path: Sequence[str], mode: str) -> None:
+        values: list[float] = []
+        for block in blocks:
+            node: Any = block
+            for key in path:
+                current = _as_mapping(node)
+                node = current.get(key) if current is not None else None
+            number = _finite_number(node)
+            if number is not None:
+                values.append(number)
+        if not values:
+            return
+        chosen = max(values) if mode == "max" else min(values)
+        node = merged
+        for key in path[:-1]:
+            child = _as_mapping(node.get(key)) if isinstance(node, Mapping) else None
+            if child is None:
+                return
+            node = child
+        if isinstance(node, MutableMapping):
+            node[path[-1]] = chosen
+
+    # For Y7 take the whole per-category measurement from the worst seed so the
+    # TP/FP/FN/TN/recall consistency check remains valid.
+    for category in RISK_CATEGORIES:
+        candidates: list[tuple[float, Mapping[str, Any]]] = []
+        for block in blocks:
+            y7 = _as_mapping(block.get("y7"))
+            measurements = _as_mapping(y7.get("measurements")) if y7 is not None else None
+            measurement = (
+                _as_mapping(measurements.get(category)) if measurements is not None else None
+            )
+            recall = _finite_number(measurement.get("recall")) if measurement is not None else None
+            if measurement is not None and recall is not None:
+                candidates.append((recall, measurement))
+        if not candidates:
+            continue
+        worst_measurement = min(candidates, key=lambda pair: pair[0])[1]
+        merged_y7 = _as_mapping(merged.get("y7"))
+        merged_measurements = (
+            _as_mapping(merged_y7.get("measurements")) if merged_y7 is not None else None
+        )
+        if isinstance(merged_measurements, MutableMapping):
+            merged_measurements[category] = dict(worst_measurement)
+    _worst(("y8", "xstest_over_refusal_rate"), "max")
+    _worst(("int8_export", "accuracy_drop_points"), "max")
+    _worst(("reproducibility_delta_points",), "max")
+    _worst(("resume", "abs_diff"), "max")
+    if len(blocks) > 1:
+        warnings.append(
+            "verdict evidence aggregated across seeds (worst value wins; no cherry-picking)"
+        )
+
+
 def _collect_run_evidence(runs: Sequence[Mapping[str, Any]], warnings: list[str]) -> dict[str, Any]:
     merged: dict[str, Any] = {}
     robustness_blocks: list[Any] = []
     benchmarks: list[Any] = []
+    evidence_blocks: list[Mapping[str, Any]] = []
     for run in runs:
         evidence = run.get("evidence")
         if isinstance(evidence, Mapping):
-            _deep_merge(merged, evidence)
+            # Deep-copy: merging later seeds must never rewrite an earlier
+            # run's evidence (or the per-seed verdicts evaluated below).
+            evidence_blocks.append(copy.deepcopy(dict(evidence)))
+            _deep_merge(merged, copy.deepcopy(dict(evidence)))
         block = run.get("robustness")
         if block is not None:
             if hasattr(block, "to_dict") and callable(block.to_dict):
@@ -1316,20 +1801,73 @@ def _collect_run_evidence(runs: Sequence[Mapping[str, Any]], warnings: list[str]
         if isinstance(benchmark, Mapping):
             benchmarks.append(dict(benchmark))
     if robustness_blocks:
-        merged["robustness"] = robustness_blocks[0]
+        merged["robustness"] = _aggregate_robustness_blocks(robustness_blocks, warnings)
         merged["robustness_blocks"] = robustness_blocks
         if len(robustness_blocks) > 1:
             warnings.append(
                 f"{len(robustness_blocks)} runs carry a robustness block; "
-                "the first is used for verdicts"
+                "verdicts use the worst value across all seeds (no first-block cherry-picking)"
             )
     if benchmarks:
-        merged["benchmark"] = benchmarks[0]
+        merged["benchmark"] = _aggregate_benchmark_blocks(benchmarks, warnings)
         merged["benchmarks"] = benchmarks
         if len(benchmarks) > 1:
             warnings.append(
-                f"{len(benchmarks)} runs carry a benchmark block; the first is used for verdicts"
+                f"{len(benchmarks)} runs carry a benchmark block; "
+                "verdicts use worst-case latency/size and best throughput across seeds"
             )
+    _aggregate_evidence_blocks(merged, evidence_blocks, warnings)
+    return merged
+
+
+def _merge_per_seed_verdicts(
+    rows: list[VerdictRow],
+    runs: Sequence[Mapping[str, Any]],
+    metrics: Mapping[str, Any],
+    baselines: Mapping[str, Any],
+    seeds: Sequence[int],
+    main_group: str,
+) -> list[VerdictRow]:
+    """Aggregate per-seed verdict states without hiding missing/failing seeds.
+
+    Cross-seed metric criteria (Y1–Y5) are evaluated on the pooled metric
+    stream. Evidence criteria (Y2, Y6–Y13) are additionally evaluated per run;
+    a failure anywhere wins, then missing evidence, then a pass. This closes
+    the ``measured failure + missing second seed -> not-measured`` loophole.
+    """
+    if len(runs) <= 1:
+        return rows
+    per_run_rows: list[Mapping[str, VerdictRow]] = []
+    for run in runs:
+        single = _collect_run_evidence([run], [])
+        single.update(
+            {
+                "metrics": metrics,
+                "runs": [run],
+                "baselines": baselines,
+                "seeds": seeds,
+                "main_group": main_group,
+            }
+        )
+        per_run_rows.append({row.id: row for row in render_verdict(single)})
+    merged = list(rows)
+    for index, aggregate in enumerate(rows):
+        if aggregate.id not in {"Y2", "Y6", "Y7", "Y8", "Y9", "Y10", "Y11", "Y12", "Y13"}:
+            continue
+        candidates = [block[aggregate.id] for block in per_run_rows]
+        if aggregate.status == _STATUS_FAIL or any(
+            row.status == _STATUS_FAIL for row in candidates
+        ):
+            final = _STATUS_FAIL
+        elif aggregate.status == _STATUS_NOT_MEASURED or any(
+            row.status == _STATUS_NOT_MEASURED for row in candidates
+        ):
+            final = _STATUS_NOT_MEASURED
+        else:
+            final = _STATUS_PASS
+        if final != aggregate.status:
+            representative = next(row for row in candidates if row.status == final)
+            merged[index] = representative
     return merged
 
 
@@ -1341,6 +1879,7 @@ def build_report(
     *,
     negative_results: Sequence[Any] | None = None,
     main_group: str = "main",
+    starter: bool = False,
 ) -> ReportResult:
     """Build ``report.json`` + ``report.md`` under ``out_dir``.
 
@@ -1350,7 +1889,10 @@ def build_report(
     ids (``B3``…) to metric mappings (or ``BaselineMetrics``-like objects).
     ``ablations`` is a mapping ``{arm: entry}`` or a sequence of entries carrying
     ``arm``. ``negative_results=None`` synthesises the mandatory section; an
-    explicit list (even empty) is honoured verbatim.
+    explicit list (even empty) is honoured verbatim. ``starter=True`` selects
+    the clearly-marked non-acceptance mode in which ``not-measured`` blocking
+    verdicts do not fail the exit code (only real ``fail`` rows do); the mode is
+    recorded in the report. The acceptance CLI never sets it.
     """
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
@@ -1388,15 +1930,19 @@ def build_report(
         )
 
     rows = render_verdict(evidence)
+    rows = _merge_per_seed_verdicts(
+        rows, normalized_runs, metrics, baselines_norm, seeds, main_group
+    )
     claims = collect_claims(arms)
     negative = collect_negative_results(negative_results, arms, rows)
     negative_empty = len(negative) == 0
     if negative_empty:
         warnings.append("negative results section is empty — the report is invalid")
 
-    code = exit_code(rows, negative_results=negative)
+    code = exit_code(rows, negative_results=negative, starter=starter)
 
     report: dict[str, Any] = {
+        "mode": "starter" if starter else "acceptance",
         "run_id": str(normalized_runs[0]["run_id"]) if normalized_runs else out_path.name,
         "manifest": _manifest_block(normalized_runs, fingerprints, seeds, warnings),
         "metrics": metrics,
@@ -1431,11 +1977,6 @@ def build_report(
 # ---------------------------------------------------------------------------
 # markdown rendering
 # ---------------------------------------------------------------------------
-
-def _fmt_number(value: Any, digits: int = 4) -> str:
-    number = _finite_number(value)
-    return f"{number:.{digits}f}" if number is not None else "not-measured"
-
 
 def _render_metrics_section(metrics: Mapping[str, Any]) -> str:
     lines = ["## §3 Per-family per-split metrics (seeds 13, 29, 47)", ""]
@@ -1588,8 +2129,11 @@ def _render_benchmark_section(benchmark: Any) -> str:
     return "\n".join(lines)
 
 
-def _render_verdicts_section(rows: Sequence[Mapping[str, Any]]) -> str:
-    lines = ["## §8 Acceptance verdicts Y1–Y14", ""]
+def _render_verdicts_section(
+    rows: Sequence[Mapping[str, Any]], *, mode: str = "acceptance", exit_code: int | None = None
+) -> str:
+    heading = "Starter (non-acceptance) verdicts" if mode == "starter" else "Acceptance verdicts"
+    lines = [f"## §8 {heading} Y1–Y14", "", f"Mode: **{mode}**", ""]
     lines.append("| id | criterion | threshold | verdict | detail |")
     lines.append("|---|---|---|---|---|")
     failed_blocking: list[str] = []
@@ -1605,14 +2149,30 @@ def _render_verdicts_section(rows: Sequence[Mapping[str, Any]]) -> str:
         )
         if row.get("blocking") and row.get("status") == _STATUS_FAIL:
             failed_blocking.append(str(row.get("id")))
+    unmeasured_blocking = [
+        str(row.get("id"))
+        for row in rows
+        if row.get("blocking") and row.get("status") == _STATUS_NOT_MEASURED
+    ]
     lines.append("")
     if failed_blocking:
         lines.append(
             f"Blocking criteria FAILED: {', '.join(failed_blocking)} — "
             "the report command exits non-zero."
         )
-    else:
-        lines.append("No blocking criterion failed.")
+    if unmeasured_blocking:
+        lines.append(
+            f"Blocking criteria NOT MEASURED: {', '.join(unmeasured_blocking)}"
+            + (
+                " — acceptance exits non-zero."
+                if mode != "starter"
+                else " — tolerated only in starter/non-acceptance mode."
+            )
+        )
+    if not failed_blocking and not unmeasured_blocking:
+        lines.append("All blocking criteria passed.")
+    if exit_code is not None:
+        lines.append(f"Report exit code: {exit_code}")
     lines.append("")
     return "\n".join(lines)
 
@@ -1668,7 +2228,11 @@ def _render_markdown(report: Mapping[str, Any]) -> str:
         _render_arms_section(arms, claims),
         _render_robustness_section(report.get("robustness")),
         _render_benchmark_section(report.get("benchmark")),
-        _render_verdicts_section(rows),
+        _render_verdicts_section(
+            rows,
+            mode=str(report.get("mode", "acceptance")),
+            exit_code=int(report.get("exit_code", 0)),
+        ),
         "## Negative results",
         "",
     ]

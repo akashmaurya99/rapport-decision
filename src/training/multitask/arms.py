@@ -10,19 +10,16 @@ editing anything under ``configs/``.
 ``build_fixed_weight_config`` loads the on-disk A4 experiment config as the
 template (falling back to an embedded copy of it when the file is not
 reachable) and returns a complete, YAML-serializable config dict with
-``weight_mode: fixed`` and an explicit uniform weight vector
-(``1.0`` for every task). Everything not specific to the weighting scheme —
-seeds [13, 29, 47], mixture ``starter`` (55k rows), 8 epochs, AdamW, lr
-3.0e-4, fp16 — is inherited from the template unchanged, so the fixed arm is
-exactly the learned arm with the weighting replaced.
+``weight_mode: fixed`` and the explicit §3.2 default weight vector. Everything
+not specific to the weighting scheme — seeds [13, 29, 47], mixture
+``starter`` (55k rows), 8 epochs, AdamW, lr 3.0e-4, fp16 — is inherited from
+the template unchanged, so the fixed arm is exactly the learned arm with the
+weighting replaced.
 
-Note on the uniform vector: docs/training-strategy.md §3.2 lists per-term
-*default* weights (choice 1.0, pref 1.0, score 0.5, prob 0.5, conf 0.5,
-abstain 1.0, risk 0.5) and the A4 YAML comments describe the fixed arm as
-"fixed weights as per docs/training-strategy.md §3.2 defaults". The contract
-for this task fixes the arm at *uniform 1.0 across tasks* instead; that is
-what this function emits, and the deviation is deliberate — uniform 1.0 is
-the control that isolates the effect of learning the weights at all.
+The emitted weights are the same defaults the Trainer resolves for
+``weight_mode="fixed"`` (choice 1.0, preference 1.0, score 0.5, probability
+0.5, confidence 0.5, abstain 1.0, risk 0.5). The uniform 1.0 control is a
+separate arm (``weight_mode: uniform``).
 """
 
 from __future__ import annotations
@@ -32,6 +29,8 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+
+from src.training.losses import DEFAULT_WEIGHTS
 
 from .weighting import DEFAULT_TASK_NAMES
 
@@ -50,7 +49,7 @@ _FALLBACK_TEMPLATE: dict[str, Any] = {
     "arm": "A4",
     "title": "weights",
     "question": "does uncertainty weighting collapse a task?",
-    "init": "bge-small",
+    "init": "scratch",
     "variant": "compact",
     "layers": 12,
     "hidden": 384,
@@ -59,7 +58,7 @@ _FALLBACK_TEMPLATE: dict[str, Any] = {
     "weight_floor": 0.05,
     "weight_cap": 4.0,
     "head_only": False,
-    "ordering": "curriculum",
+    "ordering": "fingerprint",
     "mixture": "starter",
     "mixture_rows": 55000,
     "seeds": [13, 29, 47],
@@ -132,5 +131,7 @@ def build_fixed_weight_config(
     config["weight_mode"] = "fixed"
     config["weight_floor"] = 0.05
     config["weight_cap"] = 4.0
-    config["weights"] = {task: 1.0 for task in DEFAULT_TASK_NAMES}
+    # The fixed arm must reproduce the §3.2 default weights exactly — the same
+    # vector the Trainer resolves for weight_mode="fixed".
+    config["weights"] = {task: float(DEFAULT_WEIGHTS[task]) for task in DEFAULT_TASK_NAMES}
     return config

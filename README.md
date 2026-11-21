@@ -11,11 +11,26 @@ at frontier-LLM parity.
 
 ## Status
 
-**Plan phase — implementation in progress.** The architecture contract and
-task plan live under [`.archgen/rapport/`](.archgen/rapport/) (read
-`architecture.yaml` for the module contract and `plans/rapport.md` for the
-phases and waves). Modules are landing wave by wave; anything not described
-there does not exist yet.
+**Implemented and verified; controlled training not yet run.** The architecture
+contract and task plan live under [`.archgen/rapport/`](.archgen/rapport/)
+(read `architecture.yaml` for the module contract and `tasks.yaml` for the
+phases and waves). All modules and the end-to-end runner are present. The unit
+suite is green and the synthetic starter smoke passes end to end; no real
+115.6k training or T4 latency/VRAM measurement has been performed in this
+repository. Acceptance verdicts fail closed: with no real measured evidence
+the acceptance command exits non-zero, by design.
+
+Known limits, stated rather than hidden:
+
+* The trunk trains **from scratch** (`init: scratch`); no pretrained-trunk
+  loader exists, so the A1 init comparison is not executable.
+* Mixture ordering is the deterministic **fingerprint order**; the curriculum
+  ordering arm (A7) is not implemented.
+* The runner **refuses** any experiment knob it cannot honor instead of
+  ignoring it, and reports declared-but-unexecuted alternates in its output.
+* FP16 ONNX conversion is refused when the converter produces an invalid
+  graph (it does on the current ONNX build); FP32 export and the INT8 gate
+  remain available.
 
 ## Layout
 
@@ -28,11 +43,14 @@ there does not exist yet.
 ## Quickstart
 
 ```sh
-python -m pip install -e .[dev]   # install RAPPORT + dev tools
+python -m pip install -e '.[dev]' -c requirements.lock  # install pinned env
 python -c 'import rapport; print(rapport.__version__)'
 make probe                        # capability, VRAM, SDPA backends
-make e2e                          # full pipeline via scripts.e2e (lands with TASK-25)
+make e2e                          # full pipeline via scripts.e2e
 ```
+
+The installed distribution exposes `src.*` plus `rapport`; the mixture presets
+ship as package data, so `load_preset("starter")` works from a built wheel.
 
 `make probe` re-verifies the runtime facts the T4 run depends on — CUDA
 availability, device name, compute capability, total VRAM, SDPA backends
@@ -45,15 +63,23 @@ the hardware half of FR-CONFIG-02 that both compare against.
 
 Other pipeline entry points (`data`, `split`, `train`, `calibrate`, `report`,
 `export`, `bench`, `e2e`) delegate to `python -m scripts.e2e --stage <name>`
-and fail until that module lands. Pass a config with
-`make train config=configs/experiments/starter.yaml`.
+(`data` aliases the acquire+clean+adapt chain). Pass a config with
+`make train config=configs/experiments/starter.yaml`. Use `--starter` for the
+fast smoke path and `--acceptance` for honest fail-closed acceptance reporting;
+synthetic evidence never produces real acceptance passes. Shared settings can
+be overridden with the documented `RAPPORT_*` environment variables (CLI
+`--seed` wins over `RAPPORT_SEED`, which wins over the config's first seed).
+
+Training data is bound from the **train split only**; dev/test/OOD rows can
+never enter optimization, and every declared source must be explicitly
+admitted by its acquisition manifest before a mixture can be built.
 
 ## Development
 
 ```sh
 ruff check .   # lint
 mypy src       # typecheck
-pytest -q      # unit tests (none yet in wave 1)
+pytest -q      # unit tests
 ```
 
 CI (`.github/workflows/ci.yml`) runs lint, typecheck and pytest on push.

@@ -97,6 +97,30 @@ def test_invalid_inputs_raise_typed_error() -> None:
         distillation_loss([1.0], [0.0])  # fewer than two options
 
 
+def test_padded_logits_do_not_change_the_loss() -> None:
+    base_student = torch.tensor([[1.0, 0.5, 0.0]], dtype=torch.float32)
+    padded_student = torch.tensor([[1.0, 0.5, 1000.0]], dtype=torch.float32)
+    teacher = torch.tensor([[2.0, 0.0, -1.0]], dtype=torch.float32)
+    mask = torch.tensor([[1, 1, 0]], dtype=torch.long)
+
+    baseline = distillation_loss(base_student, teacher, option_mask=mask)
+    changed_pad = distillation_loss(padded_student, teacher, option_mask=mask)
+    # Equivalent to computing the loss on only the two real options.
+    real_only = distillation_loss([1.0, 0.5], [2.0, 0.0])
+
+    assert changed_pad.item() == pytest.approx(baseline.item(), abs=1e-6)
+    assert baseline.item() == pytest.approx(real_only.item(), abs=1e-6)
+
+
+def test_option_mask_rejects_bad_shapes_and_all_masked_rows() -> None:
+    student = torch.tensor([[1.0, 0.5, 0.0]], dtype=torch.float32)
+    teacher = torch.tensor([[2.0, 0.0, -1.0]], dtype=torch.float32)
+    with pytest.raises(DistillInputError):
+        distillation_loss(student, teacher, option_mask=[[1, 0]])
+    with pytest.raises(DistillInputError):
+        distillation_loss(student, teacher, option_mask=[[0, 0, 0]])
+
+
 def test_extreme_logits_stay_finite() -> None:
     # max-subtraction keeps the softmax finite for huge but representable logits
     student = [1e30, -1e30]

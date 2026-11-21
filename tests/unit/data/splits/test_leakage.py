@@ -263,7 +263,10 @@ class TestEndToEndThroughRouter:
             split(examples, seed=13)
         assert excinfo.value.count == 1
 
-    def test_split_raises_on_cross_split_thirteen_gram_overlap(self):
+    def test_split_reports_exclusion_for_cross_split_thirteen_gram_overlap(self):
+        # A fixed directive shared across splits used to abort the whole
+        # build. It is now quarantined and counted in the manifest, with a
+        # hard assertion on the rows that remain.
         span = " ".join(SHARED_SPAN)
         examples = []
         for uid in range(8100, 8160):
@@ -274,10 +277,21 @@ class TestEndToEndThroughRouter:
                     goal=f"goal-{uid} pre{uid}a {span} post{uid}b",
                 )
             )
-        with pytest.raises(NGramLeakageError) as excinfo:
-            split(examples, seed=13)
-        assert excinfo.value.total >= 1
-        assert set(excinfo.value.counts) <= {"dev/test", "train/dev", "train/test"}
+        # Keep a clean tail so quarantine does not remove the entire corpus.
+        for uid in range(9000, 9030):
+            examples.append(
+                make_example(uid=uid, group_id=f"g-{uid}", goal=f"unique clean goal {uid}")
+            )
+        result = split(examples, seed=13)
+        assert result.manifest.excluded_thirteen_gram_rows > 0
+        assert len(result.manifest.excluded_thirteen_gram_ids) == (
+            result.manifest.excluded_thirteen_gram_rows
+        )
+        assert len(result.examples) + result.manifest.excluded_thirteen_gram_rows == len(
+            examples
+        )
+        assert find_thirteen_gram_overlaps(result.examples) == {}
+        assert_no_leakage(result.examples)  # residual hard check passes
 
     def test_split_passes_on_clean_corpus(self):
         examples = [

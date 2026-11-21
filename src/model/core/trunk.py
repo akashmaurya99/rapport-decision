@@ -28,6 +28,7 @@ class RapportTrunk(nn.Module):
                 config.ffn,
                 config.rope_base,
                 config.rms_eps,
+                config.dropout,
             )
             for _ in range(config.layers)
         )

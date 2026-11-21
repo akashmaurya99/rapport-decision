@@ -12,7 +12,6 @@ from head_helpers import example_specs, make_batch
 
 from src.model.core import RapportConfig, count_parameters
 from src.model.head import (
-    MASK_NEG,
     NUM_TASKS,
     RISK_CATEGORIES,
     AttentionMaskError,
@@ -22,6 +21,7 @@ from src.model.head import (
     OptionMaskError,
     RapportModel,
     RapportOutput,
+    mask_neg_for,
 )
 from src.tokenization.tokenizer import GOAL_ID, OPT_ID, PAD_ID
 
@@ -179,7 +179,7 @@ def test_padding_slots_are_inert_in_mixed_batch():
     ids, attention, option_mask, task_ids = make_batch(specs)
     with torch.no_grad():
         out = model(ids, attention, option_mask, task_ids)
-    assert out.choice_logits[0, 2:].eq(MASK_NEG).all()
+    assert out.choice_logits[0, 2:].eq(mask_neg_for(out.choice_logits.dtype)).all()
     assert out.scores[0, 2:].eq(0.0).all()
     assert out.score_vector[0, 2:].eq(0.0).all()
     first_row_probs = torch.softmax(out.choice_logits[0], dim=-1)
@@ -253,6 +253,24 @@ def test_heads_add_at_most_0_6m_parameters_and_trunk_matches_spec():
     # temperature; the implementation carries 8 extra log_tau parameters.
     assert abs(report.total - spec.total) <= 16
     assert report.trunk == spec.trunk
+
+
+@pytest.mark.parametrize("variant", ["ultra", "large"])
+def test_ultra_and_large_heads_reconcile_exactly_with_spec(variant):
+    """U/L spec literals were wrong; the full model now reconciles exactly.
+
+    Mirrors the compact reconciliation above, but the corrected U/L literals
+    are exact (+8 log_tau included), so no tolerance is needed.
+    """
+    config = getattr(RapportConfig, variant)()
+    model = RapportModel(config)
+    report = count_parameters(model)
+    spec = config.spec
+    heads = report.total - spec.embedding - spec.trunk
+    assert report.trunk == spec.trunk
+    assert report.components["embedding"] == spec.embedding
+    assert heads == spec.heads_total
+    assert report.total == spec.total
 
 
 def test_choice_logits_are_listwise_softmax_compatible():

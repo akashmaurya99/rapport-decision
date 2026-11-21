@@ -26,7 +26,7 @@ import torch
 from head_helpers import example_specs, make_batch
 
 from src.model.core import RapportConfig
-from src.model.head import MASK_NEG, RapportModel
+from src.model.head import RapportModel, mask_neg_for
 from src.model.head.heads import confidence_features
 
 
@@ -146,7 +146,7 @@ def test_partial_permutation_with_padding_slots():
     with torch.no_grad():
         out = model(ids, attention, option_mask, task_ids)
     # Row 1 (2 real options + 2 padding): padding is inert.
-    assert out.choice_logits[1, 2:].eq(MASK_NEG).all()
+    assert out.choice_logits[1, 2:].eq(mask_neg_for(out.choice_logits.dtype)).all()
     assert out.scores[1, 2:].eq(0.0).all()
     assert torch.softmax(out.choice_logits[1], dim=-1)[2:].eq(0.0).all()
 

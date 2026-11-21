@@ -8,6 +8,7 @@ because this suite owns no conftest of its own.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import sys
 from pathlib import Path
@@ -24,6 +25,7 @@ from src.data.core.schema import (  # noqa: E402
     Option,
     compute_example_id,
 )
+from src.data.splits.fingerprint import membership_fingerprint  # noqa: E402
 from src.data.splits.manifest import SplitManifest  # noqa: E402
 from src.evaluation.robustness import (  # noqa: E402
     LENGTH_BUDGETS,
@@ -71,9 +73,15 @@ def _row(family, goal, state, options, chosen, split, source, scores=None, gid=N
     )
 
 
+def _fixture_fingerprint() -> str:
+    corpus, ood = _corpus()
+    rows = [row for family_rows in corpus.values() for row in family_rows] + ood
+    return membership_fingerprint((row.example_id, row.split) for row in rows)
+
+
 def _manifest() -> SplitManifest:
     return SplitManifest(
-        fingerprint=FINGERPRINT,
+        fingerprint=_fixture_fingerprint(),
         counts={
             "choice": {"train": 2, "dev": 0, "test": 6},
             "preference": {"train": 1, "dev": 0, "test": 2},
@@ -126,7 +134,7 @@ def _corpus():
               "scoring": test[8:]}
     ood = [
         _row("choice", "ood heldout", f"{_EMPTY_STATE} Heldout option looks best here.",
-             ("Alpha option", "Beta option"), 0, "test", "heldout-source"),
+             ("Alpha option", "Beta option"), 0, "test", "UltraFeedback-binarized"),
         _row("choice", "ood leaked", f"{_EMPTY_STATE} Leaked option looks best here.",
              ("Alpha option", "Beta option"), 1, "test", "fixture-train"),
     ]
@@ -144,11 +152,15 @@ def model():
     return RapportModel(RapportConfig.ultra()).eval()
 
 
-def _run(model, corpus=None, ood=None, seed=20261119, split_manifest="a1" * 32):
+def _run(model, corpus=None, ood=None, seed=20261119, split_manifest=None):
     if corpus is None or ood is None:
         default_corpus, default_ood = _corpus()
         corpus = default_corpus if corpus is None else corpus
         ood = default_ood if ood is None else ood
+    if split_manifest is None:
+        rows = [row for family_rows in corpus.values() for row in family_rows] + ood
+        fingerprint = membership_fingerprint((row.example_id, row.split) for row in rows)
+        split_manifest = dataclasses.replace(_manifest(), fingerprint=fingerprint)
     return run_robustness(model, TOKENIZER, corpus, split_manifest, ood, _bucket_fn,
                           seed=seed)
 
@@ -217,8 +229,9 @@ def test_report_is_json_serializable_grouped_by_family_and_deterministic(model):
     assert round_tripped == data
     assert first.to_dict() == second.to_dict()
 
-    assert data["split_manifest_fingerprint"] == FINGERPRINT
-    assert data["ood_source"] is None  # str manifest carries no ood_source
+    assert data["split_manifest_fingerprint"] == _fixture_fingerprint()
+    assert data["ood_source"] == "UltraFeedback-binarized"
+    assert "raw-confidence-head-diagnostic" in data["confidence_semantics"]
     assert data["rows"] == {"train": 3, "evaluated": 9, "ood": 2}
     for block in ("permutation", "option_count_sweep", "length_sweep"):
         assert "choice" in data[block]
@@ -233,7 +246,7 @@ def test_report_is_json_serializable_grouped_by_family_and_deterministic(model):
 def test_manifest_object_echoes_ood_source(model):
     corpus, ood = _corpus()
     report = _run(model, corpus, ood, split_manifest=_manifest())
-    assert report.split_manifest_fingerprint == FINGERPRINT
+    assert report.split_manifest_fingerprint == _fixture_fingerprint()
     assert report.ood_source == "UltraFeedback-binarized"
     assert report.ood["ood_source"] == "UltraFeedback-binarized"
 
@@ -357,9 +370,9 @@ def test_held_out_source_block_excludes_sources_with_training_rows(model):
     assert block["n_rows"] == 1
     assert block["n_excluded"] == 1
     assert block["excluded_sources"] == ["fixture-train"]
-    assert block["sources"] == ["heldout-source"]
+    assert block["sources"] == ["UltraFeedback-binarized"]
     assert block["by_family"]["choice"]["n_rows"] == 1
-    assert block["split_manifest_fingerprint"] == FINGERPRINT
+    assert block["split_manifest_fingerprint"] == _fixture_fingerprint()
     json.dumps(block)
 
 
@@ -589,3 +602,62 @@ def test_unknown_family_and_bad_option_counts_rejected(model):
     with pytest.raises(RobustnessInputError):
         run_robustness(model, TOKENIZER, {"choice": [out_of_range]}, "a1" * 32, [],
                        _bucket_fn)
+
+
+# ---------------------------------------------------------------------------
+# NaN robustness and model-device inference (audit findings 7 & 8)
+# ---------------------------------------------------------------------------
+
+
+class _NaNModel(torch.nn.Module):
+    """Emits non-finite scores/logits/confidence for every row."""
+
+    def forward(self, input_ids, attention_mask, option_mask, task_ids):
+        n = option_mask.shape[1]
+        return _NaNOutput(n)
+
+
+class _NaNOutput:
+    def __init__(self, n):
+        nan = torch.full((1, n), float("nan"), dtype=torch.float32)
+        self.scores = nan
+        self.choice_logits = nan.clone()
+        self.confidence = torch.full((1, 1), float("nan"), dtype=torch.float32)
+
+
+class _DeviceRecordingModel(torch.nn.Module):
+    """Records the device of every input tensor; holds a parameter on ``device``."""
+
+    def __init__(self, device):
+        super().__init__()
+        self.probe = torch.nn.Parameter(torch.zeros(1, device=torch.device(device)))
+        self.seen = []
+
+    def forward(self, input_ids, attention_mask, option_mask, task_ids):
+        self.seen.extend([input_ids.device, attention_mask.device,
+                          option_mask.device, task_ids.device])
+        n = option_mask.shape[1]
+        return _StubOutput([0.5] * n)
+
+
+def test_non_finite_scores_make_measurements_not_measured():
+    corpus, ood = _corpus()
+    report = run_robustness(_NaNModel(), TOKENIZER, corpus, _manifest(), ood,
+                            _bucket_fn)
+    perm = report.permutation["overall"]
+    assert perm["within_tolerance"] is None
+    assert perm["score_max_deviation"] is None
+    assert report.option_count_sweep["choice"]["2"]["accuracy"] is None
+    assert report.ood["accuracy"] is None
+    assert report.context["contradictory"]["overall"]["abstention_rate_clean"] is None
+    json.dumps(report.to_dict())
+
+
+def test_inputs_are_moved_to_the_model_device():
+    corpus, ood = _corpus()
+    model = _DeviceRecordingModel("meta")
+    was_training = model.training
+    run_robustness(model, TOKENIZER, corpus, _manifest(), ood, _bucket_fn)
+    assert model.seen, "the fake model must have been called"
+    assert all(str(device) == "meta" for device in model.seen)
+    assert model.training is was_training  # mode restored

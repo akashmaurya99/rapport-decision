@@ -136,7 +136,7 @@ class ChoiceAdapter:
     """
 
     name = "choice"
-    source = "cais/mmlu"
+    source = "cais/mmlu#auxiliary_train"
     license = "MIT"
     task_family = "choice"
     default_split = "train"

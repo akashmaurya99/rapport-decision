@@ -6,9 +6,11 @@ Public surface
 * :class:`RunRegistry` — indexes every valid run under a runs directory by
   ``run_id``; invalid runs are excluded and counted, never silently listed
   (FR-OPS-02).
-* :func:`verify_resume` — fixed-seed, bounded replay of a recorded tiny
-  deterministic workload; asserts the reproduced loss matches the recorded
-  value within 1e-4 (FR-OPS-03). Verifies harness determinism, not a network.
+* :func:`verify_resume` — either compare two loss trajectories
+  ``(trajectory_a, trajectory_b, tolerance=1e-4) -> bool`` (the e2e helper),
+  or run a fixed-seed, bounded replay of the recorded tiny deterministic
+  workload (``seed=..., recorded_loss=...``) returning a ReproductionResult
+  (FR-OPS-03). Both verify harness determinism, not a trained network.
 """
 
 from .errors import (

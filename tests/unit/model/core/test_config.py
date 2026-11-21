@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import re
+from dataclasses import replace
 from pathlib import Path
+
+import pytest
 
 from src.model.core import RapportConfig, expected_parameter_counts
 from src.model.core.config import SpecConstants
@@ -48,7 +51,15 @@ def test_variants_instantiate_with_expected_shapes():
 def test_rope_base_is_10000_for_all_variants():
     for variant in (RapportConfig.ultra(), RapportConfig.compact(), RapportConfig.large()):
         assert variant.rope_base == 10_000.0
-        assert variant.max_seq_len == 512
+    # No dead max_seq_len field: the acceptance config's infer_max_length=1024
+    # must not be contradicted by a hard-coded model-side length cap.
+
+
+@pytest.mark.parametrize("bad", [-0.1, 1.0, 1.5])
+def test_dropout_range_is_validated_and_defaults_to_zero(bad):
+    assert RapportConfig.compact().dropout == 0.0
+    with pytest.raises(ValueError, match="dropout"):
+        replace(RapportConfig.compact(), dropout=bad)
 
 
 def test_compact_spec_constants_match_the_spec_document_values():

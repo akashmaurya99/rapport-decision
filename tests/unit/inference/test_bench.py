@@ -195,6 +195,7 @@ def test_run_benchmark_reports_both_batches_with_contract_defaults(report: Bench
     for values in (report.p50_ms, report.p95_ms, report.p99_ms):
         assert all(v is not None and v > 0 for v in values.values())
 
+    assert report.throughput_decisions_per_s is not None
     assert report.throughput_decisions_per_s > 0
     fp32 = report.measurements["fp32"]
     assert fp32["32"]["throughput_decisions_per_s"] > 0
@@ -261,7 +262,9 @@ def test_run_benchmark_report_is_json_serializable(report: BenchReport) -> None:
     assert decoded["warmup"] == 50
     assert decoded["iters"] == 1000
     assert set(decoded["environment"]) == set(ENVIRONMENT_KEYS)
-    assert set(decoded["measurements"]) == set(PRECISIONS)
+    assert set(PRECISIONS) <= set(decoded["measurements"])
+    # The FP32-ORT gate baseline is an extra measurement key when an FP32
+    # ONNX artifact was available; torch precisions are always present.
     assert set(decoded["measurements"]["fp32"]) == {"1", "32"}
 
 
@@ -318,11 +321,14 @@ def test_run_benchmark_gate_report_is_evaluated(
         batch_sizes=(1,),
         warmup=0,
         iters=1,
-        precision=("fp32",),
+        precision=("fp32", "int8"),
         gate_report=gate_report,
     )
-    assert result.quantization_gate["status"] == "passed"
-    assert result.quantization_gate["artifact"] == "int8"
+    # The caller's declared 2.5x speedup is ignored in favor of THIS run's
+    # synchronized FP32-ORT/INT8 measurements; on this host it does not reach 2x.
+    assert result.quantization_gate["status"] == "failed"
+    assert result.quantization_gate["artifact"] == "fp16"
+    assert result.quantization_gate["margins"]["p95_latency_speedup"] < 2.5
 
 
 def test_run_benchmark_gate_report_invalid_is_recorded_as_error(
@@ -334,7 +340,7 @@ def test_run_benchmark_gate_report_invalid_is_recorded_as_error(
         batch_sizes=(1,),
         warmup=0,
         iters=1,
-        precision=("fp32",),
+        precision=("fp32", "int8"),
         gate_report={"fp32_p95_ms": 100.0},
     )
     assert result.quantization_gate["status"] == "error"
@@ -388,3 +394,90 @@ def test_flags_against_on_bench_report_dataclass() -> None:
     flags = changed.flags_against(report)
     assert len(flags) == 1
     assert "driver" in flags[0]
+
+
+# ---------------------------------------------------------------------------
+# audit finding 6: synchronized single-array timing, INT8 gate baseline
+# ---------------------------------------------------------------------------
+
+
+def test_measure_derives_p50_p95_p99_from_one_latency_array(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.inference import bench as bm
+
+    calls: list[int] = []
+
+    class _Session:
+        def run(self, output_names, feed):  # noqa: ANN001, ANN202
+            calls.append(1)
+
+    ticks = iter(float(i) / 1000.0 for i in range(100))
+    monkeypatch.setattr(bm.time, "perf_counter", lambda: next(ticks))
+    measured = bm._measure(
+        _Session(), {"x": torch.zeros(1)}, rows=1,
+        warmup=2, iters=3, device_type="cpu",
+    )
+    # warmup + timed passes only — no separate p95 pass.
+    assert len(calls) == 5
+    assert measured["p50_ms"] == pytest.approx(1.0)
+    assert measured["p95_ms"] == pytest.approx(1.0)
+    assert measured["p99_ms"] == pytest.approx(1.0)
+
+
+def test_int8_gate_baseline_is_fp32_ort_not_torch(
+    model: RapportModel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pathlib import Path
+
+    from src.inference import bench as bm
+
+    class _FakeORT:
+        def __init__(self, path: str) -> None:
+            self.path = path
+
+        def run(self, output_names, feed):  # noqa: ANN001, ANN202
+            return (torch.zeros(1, 2),)
+
+    loaded: list[str] = []
+
+    def _fake_load(path: Path):
+        loaded.append(str(path))
+        return _FakeORT(str(path)), None
+
+    monkeypatch.setattr(bm, "_load_ort_session", _fake_load)
+    monkeypatch.setattr(
+        bm, "_resolve_artifacts",
+        lambda model, tokenizer, artifacts_dir, int8_artifact: (
+            {"fp32": 10, "fp16": None, "int8": 10},
+            Path("/tmp/fake-int8.onnx"), "", None, Path("/tmp/fake-fp32.onnx"),
+        ),
+    )
+    result = bm.run_benchmark(
+        model, RapportTokenizer(), batch_sizes=(1,), iters=2, warmup=0,
+        precision=("fp32", "int8"),
+    )
+    assert any("fake-fp32.onnx" in p for p in loaded)
+    assert "fp32_ort" in result.measurements
+    baseline = result.measurements["fp32_ort"]["1"]["p95_ms"]
+    assert baseline is not None and baseline > 0
+    # The stand-in gate baseline is the FP32-ORT number, not torch's p95.
+    assert result.quantization_gate["stand_in_report"]["fp32_p95_ms"] == pytest.approx(baseline)
+
+
+def test_skipped_top_level_throughput_stays_none(
+    model, tokenizer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.inference import bench as bm
+    monkeypatch.setattr(
+        bm, "_resolve_artifacts",
+        lambda model, tokenizer, artifacts_dir, int8_artifact: (
+            {"fp32": None, "fp16": None, "int8": None}, None, "no artifact", None, None,
+        ),
+    )
+    result = run_benchmark(
+        model, tokenizer, batch_sizes=(1,), iters=2, warmup=0,
+        precision=("int8",),
+    )
+    assert result.measurements["int8"]["1"]["throughput_decisions_per_s"] is None
+    assert result.throughput_decisions_per_s is None

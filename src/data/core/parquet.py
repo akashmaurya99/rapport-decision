@@ -6,6 +6,11 @@ dependency of this project, so this module imports it lazily and raises
 recorded here, not invented elsewhere. Callers that need hard guarantees
 should declare pyarrow themselves.
 
+Read-back path: :func:`acquire_source` writes raw source columns by default,
+which this reader cannot parse (they are not ``DecisionExample`` records).
+Pass an adapter to ``acquire_source(..., adapter=...)`` so shards are written
+in the unified layout below; then :func:`read_parquet` reads them directly.
+
 The parquet layout is one row per example: scalar string columns for the
 contract's required fields, nullable columns for the optional ones, and a
 ``list<struct<text:string,label:string>>`` column for the options, matching
