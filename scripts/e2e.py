@@ -171,6 +171,7 @@ class Args:
     reference_losses: Path | None
     stage: str
     steps_explicit: bool = False
+    skip_near_dedup: bool = False
 
 
 @dataclass(frozen=True)
@@ -325,6 +326,11 @@ def parse_args(argv: Sequence[str] | None = None) -> Args:
     parser.add_argument("--evidence-file", default=None, help="JSON with recorded evidence")
     parser.add_argument("--reference-losses", default=None, help="uninterrupted loss JSON")
     parser.add_argument(
+        "--skip-near-dedup",
+        action="store_true",
+        help="skip the O(n^2) near-duplicate scan for curated, already-unique corpora",
+    )
+    parser.add_argument(
         "--stage",
         choices=STAGE_CHOICES,
         default="e2e",
@@ -369,6 +375,7 @@ def parse_args(argv: Sequence[str] | None = None) -> Args:
         reference_losses=Path(ns.reference_losses) if ns.reference_losses else None,
         stage=ns.stage,
         steps_explicit=ns.steps is not None,
+        skip_near_dedup=bool(ns.skip_near_dedup),
     )
 
 
@@ -559,7 +566,7 @@ def prepare_pipeline_data(
     """Run acquire, adapt, clean, split and sample on real rows."""
     data = PipelineData(raw_rows=list(raw_rows))
     data.adapted_rows, data.adapt = _adapt_rows(mode, raw_rows, seed)
-    cleaned = clean_examples(data.adapted_rows)
+    cleaned = clean_examples(data.adapted_rows, skip_near_dedup=args.skip_near_dedup)
     data.clean_rows = list(cleaned.kept)
     data.clean = {
         "input_rows": len(data.adapted_rows),

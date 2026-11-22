@@ -48,10 +48,27 @@ def clean_examples(
     near_threshold: float = DEFAULT_NEAR_THRESHOLD,
     max_tokens: int = DEFAULT_MAX_TOKENS,
     contested_path: str | Path | None = None,
+    skip_near_dedup: bool = False,
 ) -> CleanResult:
-    """Run the cleaning pipeline and return kept rows, contested rows, report."""
+    """Run the cleaning pipeline and return kept rows, contested rows, report.
+
+    ``skip_near_dedup`` is for curated corpora whose rows are already unique by
+    construction (each prompt/question appears once). Near-dedup generates
+    O(n²) candidates and is intended for scraped, redundant corpora; skipping it
+    here avoids hours of work while keeping exact dedup, contradiction and Q1-Q6.
+    """
     exact = ExactDedup().run(examples)
-    near = NearDedup(threshold=near_threshold).run(exact.kept)
+    if skip_near_dedup:
+        from .dedup import NearDedupResult
+
+        near = NearDedupResult(
+            kept=exact.kept,
+            removed_ids=(),
+            per_source={},
+            threshold=near_threshold,
+        )
+    else:
+        near = NearDedup(threshold=near_threshold).run(exact.kept)
     contradiction = ContradictionAudit().run(near.kept, contested_path=contested_path)
     quality = QualityFilter(max_tokens=max_tokens).run(contradiction.kept)
 
