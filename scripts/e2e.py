@@ -1106,7 +1106,10 @@ def _training_config(ctx: RunContext) -> TrainingConfig:
         warmup_ratio=float(experiment.value("warmup_ratio", 0.05)),
         grad_clip_norm=float(experiment.value("grad_clip", 1.0)),
         fp16=ctx.resolved.fp16,
-        checkpoint_every=max(1, ctx.args.steps),
+        # A run-wide cadence would save only at the final step, so a Colab
+        # session drop would lose the entire run. Default to the trainer's
+        # 500-step cadence and let the experiment override it.
+        checkpoint_every=int(experiment.value("checkpoint_every", 500)),
         checkpoint_dir=str(ctx.checkpoint_dir),
         # Retention is a disk-budget control: keep the three most recent
         # checkpoints unless the config says otherwise.
