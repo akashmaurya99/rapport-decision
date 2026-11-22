@@ -303,12 +303,18 @@ class NearDedup:
         total = len(signatures)
         if total < 2:
             return
+        # The first few MinHash positions are near-constant for this hasher
+        # (the seed produces the same minimum for many unrelated sets), so a
+        # band starting at index 0 would bucket almost everything together.
+        # Skip that prefix and use the remaining, well-mixed positions.
         rows_per_band = 6
-        bands = min(21, max(1, self._hasher.num_perm // rows_per_band))
+        offset = min(16, max(0, self._hasher.num_perm // 8))
+        available = self._hasher.num_perm - offset
+        bands = max(1, available // rows_per_band)
         buckets: dict[tuple, list[int]] = {}
         for index, signature in enumerate(signatures):
             for band in range(bands):
-                start = band * rows_per_band
+                start = offset + band * rows_per_band
                 key = (
                     band,
                     tuple(int(value) for value in signature[start:start + rows_per_band]),
