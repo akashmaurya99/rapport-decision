@@ -290,11 +290,40 @@ class NearDedup:
     def _candidate_pairs(
         self, signatures: Sequence[np.ndarray]
     ) -> Iterator[tuple[int, int]]:
-        """Yield all ``(i, j)`` with ``i < j``. O(n²); fixture scale only."""
+        """Yield likely-similar ``(i, j)`` pairs using banded LSH.
+
+        The old implementation yielded all O(n²) pairs, which is fine for
+        fixtures but makes a 115k-row corpus take days. Banded MinHash drops a
+        pair only when its signatures share no band; with ``rows_per_band=6``
+        and 21 bands a pair at Jaccard 0.9 survives with probability
+        ``1 - (1 - 0.9**6)**21 > 1 - 1e-6``, so no genuine duplicate is lost in
+        practice. The pair set is a superset of the near-duplicates and the
+        exact Jaccard estimate in :meth:`run` still decides every union.
+        """
         total = len(signatures)
-        for i in range(total):
-            for j in range(i + 1, total):
-                yield i, j
+        if total < 2:
+            return
+        rows_per_band = 6
+        bands = min(21, max(1, self._hasher.num_perm // rows_per_band))
+        buckets: dict[tuple, list[int]] = {}
+        for index, signature in enumerate(signatures):
+            for band in range(bands):
+                start = band * rows_per_band
+                key = (
+                    band,
+                    tuple(int(value) for value in signature[start:start + rows_per_band]),
+                )
+                buckets.setdefault(key, []).append(index)
+        yielded: set[tuple[int, int]] = set()
+        for members in buckets.values():
+            if len(members) < 2:
+                continue
+            ordered = sorted(members)
+            for position, left in enumerate(ordered):
+                for right in ordered[position + 1:]:
+                    if (left, right) not in yielded:
+                        yielded.add((left, right))
+                        yield left, right
 
     def run(self, examples: Sequence[DecisionExample]) -> NearDedupResult:
         signatures = [
