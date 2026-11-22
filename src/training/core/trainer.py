@@ -298,6 +298,12 @@ class Trainer:
         self._sampler_offset = 0
         self.nonfinite_steps = 0
         self.nonfinite_steps_epoch = 0
+        # Consecutive non-finite steps. Divergence is *persistent*, not
+        # cumulative: fp16 GradScaler overflows can skip a few early batches
+        # before backing off, and a long run must not accumulate them into a
+        # false TRAINING_DIVERGED. A single successful optimizer step clears
+        # the streak.
+        self.nonfinite_streak = 0
 
         self.model: nn.Module | None = None
         self.weighter: TaskWeighter | None = None
@@ -383,11 +389,13 @@ class Trainer:
     def _register_nonfinite(self, reason: str) -> None:
         self.nonfinite_steps += 1
         self.nonfinite_steps_epoch += 1
-        if self.nonfinite_steps_epoch > self.config.nonfinite_per_epoch:
+        self.nonfinite_streak += 1
+        if self.nonfinite_streak > self.config.nonfinite_per_epoch:
             raise TrainingDivergedError(
-                f"{self.nonfinite_steps_epoch} non-finite steps in epoch {self.epoch} "
-                f"(limit {self.config.nonfinite_per_epoch}); last reason: {reason}",
-                nonfinite_steps=self.nonfinite_steps_epoch,
+                f"{self.nonfinite_streak} consecutive non-finite steps in epoch "
+                f"{self.epoch} (limit {self.config.nonfinite_per_epoch}); "
+                f"last reason: {reason}",
+                nonfinite_steps=self.nonfinite_streak,
                 epoch=self.epoch,
             )
 
@@ -565,6 +573,9 @@ class Trainer:
         self.scaler.update()
         self.scheduler.step()
         self.step += 1
+        # A completed optimizer step proves the trajectory recovered; transient
+        # overflows must not accumulate into a divergence verdict.
+        self.nonfinite_streak = 0
 
         loss_value = float(loss.detach())
         self._emit_step_record(loss=loss_value, skipped=False, reason=None, grad_norm=grad_norm)
@@ -633,6 +644,7 @@ class Trainer:
             # epoch-end checkpoint so resume does not replay this epoch.
             self.epoch += 1
             self.nonfinite_steps_epoch = 0
+            self.nonfinite_streak = 0
             self._log_epoch(history[epoch_start:])
             self.save()  # epoch-end checkpoint
             if self.logger is not None:
@@ -678,6 +690,7 @@ class Trainer:
             "sampler_offset": self.sampler_offset,
             "nonfinite_steps": self.nonfinite_steps,
             "nonfinite_steps_epoch": self.nonfinite_steps_epoch,
+            "nonfinite_streak": self.nonfinite_streak,
             "model": self.model.state_dict(),  # type: ignore[union-attr]
             "optimizer": self.optimizer.state_dict(),
             "scaler": self.scaler.state_dict(),
@@ -802,8 +815,18 @@ class Trainer:
                 f"checkpoint {path} is missing a valid 'weighter' state", key="weighter"
             )
         counters: dict[str, int] = {}
-        for key in ("epoch", "sampler_offset", "nonfinite_steps", "nonfinite_steps_epoch"):
+        for key in (
+            "epoch",
+            "sampler_offset",
+            "nonfinite_steps",
+            "nonfinite_steps_epoch",
+            "nonfinite_streak",
+        ):
             value = payload.get(key)
+            if value is None and key == "nonfinite_streak":
+                # Written before the streak counter existed; a resumed run has
+                # no recorded streak, so it starts at zero.
+                value = 0
             if type(value) is not int or value < 0:
                 raise CheckpointError(
                     f"checkpoint {path} has invalid {key!r}: {value!r}", key=key
@@ -839,6 +862,7 @@ class Trainer:
         self.sampler_offset_restore(counters["sampler_offset"])
         self.nonfinite_steps = counters["nonfinite_steps"]
         self.nonfinite_steps_epoch = counters["nonfinite_steps_epoch"]
+        self.nonfinite_streak = counters["nonfinite_streak"]
         return self.step
 
     def sampler_offset_restore(self, offset: int) -> None:

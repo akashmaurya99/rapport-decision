@@ -88,6 +88,13 @@ class RapportOutput:
     * ``risk`` — ``[B, 8]``;
     * ``score_vector`` — ``[B, n]`` raw cosine score divided by the per-task
       temperature (spec §6 ``s_i``; padding slots 0).
+
+    The three optional ``*_logits`` fields carry the raw pre-sigmoid values the
+    losses consume through :func:`torch.nn.functional.binary_cross_entropy_with_logits`.
+    They exist because an fp16 sigmoid saturates to exactly 0 or 1, which makes
+    a hand-rolled ``log(p)`` BCE produce ``-inf``. Omitted only for synthetic
+    outputs (e.g. unit-test doubles); when absent the loss falls back to the
+    probability path and raises ``LossNotFiniteError`` on a degenerate value.
     """
 
     choice_logits: Tensor
@@ -97,6 +104,9 @@ class RapportOutput:
     answerable: Tensor
     risk: Tensor
     score_vector: Tensor
+    probability_logits: Tensor | None = None
+    confidence_logits: Tensor | None = None
+    risk_logits: Tensor | None = None
 
 
 class _ConditionedTrunk(RapportTrunk):
@@ -404,10 +414,13 @@ class RapportModel(nn.Module):
         # CLS analogue: hidden state at the derived <task> marker position.
         cls_index = task_positions.view(-1, 1, 1).expand(-1, -1, hidden.shape[-1])
         cls_vector = hidden.gather(1, cls_index).squeeze(1)
-        probability = self.probability_head(cls_vector)  # [B, 1]
+        probability_logits = self.probability_head.logits(cls_vector)  # [B, 1]
+        probability = torch.sigmoid(probability_logits)
         confidence_input = confidence_features(cls_vector, readout.probabilities)
-        confidence = self.confidence_head(confidence_input)  # [B, 1]
-        risk = self.risk_head(cls_vector)  # [B, 8]
+        confidence_logits = self.confidence_head.logits(confidence_input)  # [B, 1]
+        confidence = torch.sigmoid(confidence_logits)
+        risk_logits = self.risk_head.logits(cls_vector)  # [B, 8]
+        risk = torch.sigmoid(risk_logits)
 
         return RapportOutput(
             choice_logits=readout.choice_logits,
@@ -417,4 +430,7 @@ class RapportModel(nn.Module):
             answerable=probability,  # absorbed into the probability head (documented)
             risk=risk,
             score_vector=readout.score_vector,
+            probability_logits=probability_logits,
+            confidence_logits=confidence_logits,
+            risk_logits=risk_logits,
         )

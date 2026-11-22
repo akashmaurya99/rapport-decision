@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 
 import pytest
-from conftest import (  # noqa: I001
+from e2e_test_support import (
     ACCEPTANCE,
     REPO_ROOT,
     SCRIPT,

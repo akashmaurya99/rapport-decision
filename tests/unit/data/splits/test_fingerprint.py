@@ -6,7 +6,7 @@ import hashlib
 import json
 
 import pytest
-from conftest import make_example
+from splits_test_support import make_example
 
 from src.data.splits import is_sha256_hex, membership_fingerprint, split
 

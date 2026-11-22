@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import pytest
-from conftest import make_example
+from splits_test_support import make_example
 
 from src.data.core.schema import TASK_FAMILIES
 from src.data.splits import (

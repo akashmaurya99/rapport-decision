@@ -28,7 +28,7 @@ REPO_ROOT = Path(__file__).resolve().parents[4]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from conftest import (  # noqa: E402
+from trainer_core_support import (  # noqa: E402
     NanGradModel,
     NanLogitModel,
     StubRapportModel,
@@ -527,9 +527,10 @@ def test_nonfinite_counter_resets_each_epoch(tmp_path: Path) -> None:
     for batch in logger_batches:
         trainer.train_batch(batch)
     assert trainer.nonfinite_steps_epoch == 2
-    # Simulate an epoch boundary.
+    # Simulate an epoch boundary (Trainer.fit resets both counters there).
     trainer.epoch += 1
     trainer.nonfinite_steps_epoch = 0
+    trainer.nonfinite_streak = 0
     result = trainer.train_batch(make_batch(12302))
     assert result.skipped
     assert trainer.nonfinite_steps_epoch == 1

@@ -1295,19 +1295,46 @@ def stage_train(ctx: RunContext) -> TrainOutcome:
         )
 
     if not ctx.resolved.fp16:
-        print("[e2e] FP16 disabled: no CUDA device; training in FP32 (never fabricated)",
-              flush=True)
+        fp16_reason = (
+            "no CUDA device"
+            if ctx.resolved.device != "cuda"
+            else "fp16 disabled by configuration"
+        )
+        print(
+            f"[e2e] FP16 disabled: {fp16_reason}; "
+            "training in FP32 (never fabricated)",
+            flush=True,
+        )
 
     real_batches = _real_batches(ctx) if ctx.mode == "real" else []
     trajectory = _load_trajectory(ctx)
     base_seed = 10_000 + ctx.resolved.seed
     final_loss: float | None = None
-    for step in range(resumed_step, ctx.args.steps):
+    # The budget counts COMPLETED optimizer steps. A non-finite batch is
+    # skipped without advancing ``trainer.step`` (and without changing the
+    # scheduler), so iterating a fixed number of *batches* would declare a
+    # healthy run failed whenever any skip occurred. Consume batches until the
+    # step budget is met, with a generous cap so a pathological stream cannot
+    # loop forever; persistent divergence already raises from the trainer.
+    # On resume the deterministic batch stream must continue from the restored
+    # step, not restart at index 0 — otherwise the first post-resume batch is a
+    # different fixed input and the trajectory cannot match the reference run.
+    batches_consumed = resumed_step
+    remaining = ctx.args.steps - resumed_step
+    max_batches = resumed_step + max(4 * remaining, remaining + 64)
+    while trainer.step < ctx.args.steps:
+        if batches_consumed >= max_batches:
+            raise StageFailureError(
+                f"training did not reach {ctx.args.steps} optimizer steps after "
+                f"{batches_consumed} batches consumed",
+                key="train",
+            )
         if real_batches:
-            batch = real_batches[step % len(real_batches)]
+            batch = real_batches[batches_consumed % len(real_batches)]
         else:
-            batch = e2e_fixtures.make_batch(base_seed + step)
+            batch = e2e_fixtures.make_batch(base_seed + batches_consumed)
         result = trainer.train_batch(batch)
+        batches_consumed += 1
         if result.loss is not None:
             trajectory[str(result.step)] = result.loss
             final_loss = result.loss

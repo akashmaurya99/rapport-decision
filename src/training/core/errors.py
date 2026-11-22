@@ -90,11 +90,13 @@ class CheckpointBeyondHorizonError(CheckpointError):
 
 
 class TrainingDivergedError(TrainerError):
-    """Too many non-finite gradients in one epoch (E5).
+    """Too many consecutive non-finite gradients in one epoch (E5).
 
-    Raised when the count of skipped (non-finite) steps in the current epoch
-    exceeds ``nonfinite_per_epoch`` (default 10) — the run is numerically
-    diverged and continuing would only corrupt the log.
+    Raised when the streak of skipped (non-finite) steps exceeds
+    ``nonfinite_per_epoch`` (default 10). Only a persistent streak is
+    divergence: transient fp16 overflows that the GradScaler backs off from are
+    cleared by the next successful optimizer step, so an otherwise healthy long
+    run is not aborted by early recoverable skips.
     """
 
     code = "TRAINING_DIVERGED"

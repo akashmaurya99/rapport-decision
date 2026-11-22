@@ -47,11 +47,17 @@ Degenerate inputs are handled explicitly, never by ``nan_to_num``:
   undefined there);
 * ``chosen_index`` pointing at padding or outside ``[0, n)`` raises
   :class:`ValueError`;
-* a non-finite loss — whether from non-finite model outputs, a confidently
-  wrong sigmoid output (e.g. probability exactly 0 with target 1), or NaN
-  targets caught downstream — raises :class:`LossNotFiniteError` naming the
+* a non-finite loss — whether from non-finite model outputs or NaN targets
+  caught downstream — raises :class:`LossNotFiniteError` naming the
   offending component via its ``component`` attribute. It never reaches the
   optimizer: the caller (TASK-12) counts the step and skips it.
+
+The sigmoid-headed terms (probability, confidence, abstain, risk) are computed
+with :func:`torch.nn.functional.binary_cross_entropy_with_logits` on the raw
+head logits whenever :class:`~src.model.head.RapportOutput` supplies them.
+That log-sum-exp form is finite even when an fp16 sigmoid saturates to exactly
+0 or 1; the probability fallback exists only for synthetic/test outputs that
+carry no logits and preserves the "surface degeneracy, never clamp" contract.
 """
 
 from __future__ import annotations
@@ -202,11 +208,29 @@ def _float_target(t: Tensor, *, name: str, batch: int, device: torch.device) -> 
     return target.to(device)
 
 
+def _bce_from_logits(
+    logits: Tensor, target: Tensor, pos_weight: Tensor | None = None
+) -> Tensor:
+    """Numerically stable binary cross-entropy from raw logits.
+
+    Uses PyTorch's log-sum-exp formulation rather than ``log(sigmoid(x))``,
+    which under fp16 autocast saturates to exactly 0 or 1 and turns a finite
+    label into ``-inf``. Returns the unreduced element-wise loss.
+    """
+    kwargs: dict[str, Tensor] = {}
+    if pos_weight is not None:
+        kwargs["pos_weight"] = pos_weight.float()
+    return F.binary_cross_entropy_with_logits(
+        logits.float(), target.float(), reduction="none", **kwargs
+    )
+
+
 def _bce_from_probs(
     p: Tensor, target: Tensor, pos_weight: Tensor | None = None
 ) -> Tensor:
     """Binary cross-entropy from probabilities, without a hard clamp.
 
+    Fallback for outputs that carry no raw logits (synthetic doubles only).
     ``log`` of an exactly-zero probability yields ``-inf`` and a genuinely
     non-finite (``inf``) loss, which is surfaced by the caller as
     :class:`LossNotFiniteError` — never hidden. The ``where`` guards only keep
@@ -219,6 +243,19 @@ def _bce_from_probs(
         pos = pos_weight * pos
     neg = (1.0 - target) * torch.log(safe_q)
     return -(pos + neg)
+
+
+def _bce_term(
+    p: Tensor,
+    logits: Tensor | None,
+    target: Tensor,
+    *,
+    pos_weight: Tensor | None = None,
+) -> Tensor:
+    """Element-wise BCE, preferring the stable logits path when available."""
+    if logits is not None:
+        return _bce_from_logits(logits, target, pos_weight=pos_weight)
+    return _bce_from_probs(p.float(), target, pos_weight=pos_weight)
 
 
 def _check_finite(name: str, term: Tensor) -> None:
@@ -344,8 +381,13 @@ def _probability_loss(
     if not bool(rows.any()):
         return _zero_like(reference), False
     p = output.probability.reshape(batch)[rows].float()
+    z = (
+        output.probability_logits.reshape(batch)[rows]
+        if output.probability_logits is not None
+        else None
+    )
     y = target[rows]
-    bce = _bce_from_probs(p, y)
+    bce = _bce_term(p, z, y)
     brier = (p - y) ** 2
     return (bce + _BRIER_WEIGHT * brier).mean(), True
 
@@ -364,7 +406,12 @@ def _confidence_loss(
     prediction = masked_logits.argmax(dim=-1)
     target = (prediction == chosen).float()
     p = output.confidence.reshape(mask.shape[0])[available].float()
-    return _bce_from_probs(p, target[available]).mean(), True
+    z = (
+        output.confidence_logits.reshape(mask.shape[0])[available]
+        if output.confidence_logits is not None
+        else None
+    )
+    return _bce_term(p, z, target[available]).mean(), True
 
 
 def _abstain_loss(
@@ -382,7 +429,13 @@ def _abstain_loss(
     if not bool(rows.any()):
         return _zero_like(reference), False
     p = output.answerable.reshape(batch)[rows].float()
-    return _bce_from_probs(p, target[rows]).mean(), True
+    # ``answerable`` is absorbed into the probability head, so it shares its logits.
+    z = (
+        output.probability_logits.reshape(batch)[rows]
+        if output.probability_logits is not None
+        else None
+    )
+    return _bce_term(p, z, target[rows]).mean(), True
 
 
 def _risk_loss(
@@ -429,7 +482,8 @@ def _risk_loss(
             raise ValueError("risk_pos_weight must be non-negative")
         pos_weight = pos_weight.to(reference.device)
     p = output.risk[rows].float()
-    per_category = _bce_from_probs(p, active_targets, pos_weight=pos_weight)
+    z = output.risk_logits[rows] if output.risk_logits is not None else None
+    per_category = _bce_term(p, z, active_targets, pos_weight=pos_weight)
     return per_category.mean(), True
 
 

@@ -39,12 +39,22 @@ class ProbabilityHead(nn.Module):
         self.activation = nn.GELU()
         self.output = nn.Linear(192, 1)
 
-    def forward(self, cls_vector: Tensor) -> Tensor:
+    def logits(self, cls_vector: Tensor) -> Tensor:
+        """Raw pre-sigmoid logits (``[B, 1]``).
+
+        The loss consumes these through ``binary_cross_entropy_with_logits``
+        rather than applying ``log(sigmoid(x))`` to a probability that fp16
+        rounds to exactly 0 or 1. See :func:`_bce_from_logits` in
+        ``src/training/losses.py``.
+        """
         if cls_vector.dim() != 2:
             raise ValueError(
                 f"cls_vector must be [B, d], got shape {tuple(cls_vector.shape)}"
             )
-        return torch.sigmoid(self.output(self.activation(self.input(cls_vector))))
+        return self.output(self.activation(self.input(cls_vector)))
+
+    def forward(self, cls_vector: Tensor) -> Tensor:
+        return torch.sigmoid(self.logits(cls_vector))
 
 
 class ConfidenceHead(nn.Module):
@@ -56,12 +66,16 @@ class ConfidenceHead(nn.Module):
         self.activation = nn.GELU()
         self.output = nn.Linear(128, 1)
 
-    def forward(self, features: Tensor) -> Tensor:
+    def logits(self, features: Tensor) -> Tensor:
+        """Raw pre-sigmoid logits (``[B, 1]``); see :class:`ProbabilityHead`."""
         if features.dim() != 2:
             raise ValueError(
                 f"features must be [B, d + 3], got shape {tuple(features.shape)}"
             )
-        return torch.sigmoid(self.output(self.activation(self.input(features))))
+        return self.output(self.activation(self.input(features)))
+
+    def forward(self, features: Tensor) -> Tensor:
+        return torch.sigmoid(self.logits(features))
 
 
 class RiskHead(nn.Module):
@@ -73,12 +87,16 @@ class RiskHead(nn.Module):
         self.activation = nn.GELU()
         self.output = nn.Linear(192, categories)
 
-    def forward(self, cls_vector: Tensor) -> Tensor:
+    def logits(self, cls_vector: Tensor) -> Tensor:
+        """Raw pre-sigmoid logits (``[B, categories]``); see :class:`ProbabilityHead`."""
         if cls_vector.dim() != 2:
             raise ValueError(
                 f"cls_vector must be [B, d], got shape {tuple(cls_vector.shape)}"
             )
-        return torch.sigmoid(self.output(self.activation(self.input(cls_vector))))
+        return self.output(self.activation(self.input(cls_vector)))
+
+    def forward(self, cls_vector: Tensor) -> Tensor:
+        return torch.sigmoid(self.logits(cls_vector))
 
 
 def confidence_features(cls_vector: Tensor, probabilities: Tensor) -> Tensor:
