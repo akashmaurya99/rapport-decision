@@ -1,0 +1,32 @@
+# RAPPORT pretrained-init full run — Stage A (BGE) + Stage B on 115.6k.
+# Audited partial BGE init: embeddings + attention projections copied;
+# RMSNorm/SwiGLU initialized randomly (architecture differs from BERT).
+arm: pretrained-full
+title: 115.6k pretrained-init run (Stage A+B)
+question: does audited BGE initialization improve the full-mixture model?
+init: bge-small-en-v1.5
+variant: compact
+layers: 12
+hidden: 384
+readout: cosine
+weight_mode: learned
+head_only: false
+ordering: fingerprint
+mixture: full
+mixture_rows: 115600
+max_length: 512
+infer_max_length: 512
+seeds: [13]
+data_fingerprint: ""
+epochs: 8
+batch_size: 64
+lr: 3.0e-4
+head_lr: 1.0e-3
+weight_decay: 0.01
+warmup_ratio: 0.05
+schedule: cosine
+grad_clip: 1.0
+dropout: 0.1
+label_smoothing: 0.0
+optimizer: adamw
+fp16: true

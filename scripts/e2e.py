@@ -676,7 +676,7 @@ def _model_config(ctx: RunContext) -> RapportConfig:
 #: A config that declares anything else is refused with a precise message
 #: instead of being silently ignored (an unexecuted knob is a lie).
 _HONORED_EXPERIMENT_KNOBS: dict[str, Any] = {
-    "init": "scratch",
+    "init": ("scratch", "bge-small-en-v1.5"),
     "readout": "cosine",
     "head_only": False,
     "kd": False,
@@ -698,7 +698,9 @@ def _unsupported_experiment_knobs(experiment: Experiment) -> list[str]:
         if key not in document:
             continue
         value = document[key]
-        if isinstance(value, str) and isinstance(implemented, str):
+        if isinstance(value, str) and isinstance(implemented, tuple):
+            equal = value.strip().lower() in implemented
+        elif isinstance(value, str) and isinstance(implemented, str):
             equal = value.strip().lower() == implemented
         elif isinstance(value, bool) or isinstance(implemented, bool):
             equal = bool(value) is bool(implemented)
@@ -1295,6 +1297,17 @@ def stage_train(ctx: RunContext) -> TrainOutcome:
         torch.manual_seed(ctx.resolved.seed + 999)
 
     model = RapportModel(model_config)
+    init_mode = str(ctx.experiment.value("init", "scratch")).strip().lower()
+    if init_mode == "bge-small-en-v1.5" and checkpoint is None:
+        from src.model.core.pretrained import init_trunk_from_bge
+
+        report = init_trunk_from_bge(model.trunk, model_config)
+        write_artifact(ctx, "pretrained_init.json", report.to_dict())
+        print(
+            f"[e2e] pretrained init: copied {report.to_dict()['n_copied']} tensors, "
+            f"skipped {report.to_dict()['n_skipped']} (audited)",
+            flush=True,
+        )
     trainer = Trainer(config, model, logger=ctx.train_logger)
     if checkpoint is not None:
         resumed_step = trainer.load(checkpoint)
