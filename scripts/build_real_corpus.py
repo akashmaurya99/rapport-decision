@@ -212,6 +212,12 @@ def main():
             if len(buckets["nvidia/Aegis-AI-Content-Safety-Dataset-2.0"]) >= need: break
             p, resp = r.get("prompt"), r.get("response")
             if not isinstance(p, str) or not p.strip(): continue
+            # Aegis redacts many rows to the literal "REDACTED"; skip those so
+            # they cannot collapse into one giant content-hash group that the
+            # group-aware splitter assigns wholly to a single split.
+            if p.strip().upper() == "REDACTED": continue
+            if isinstance(resp, str) and resp.strip().upper() == "REDACTED":
+                resp = None
             vc = r.get("violated_categories")
             labs = []
             if isinstance(vc, str) and vc.strip() and vc.strip().lower() != "none":
