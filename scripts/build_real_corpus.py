@@ -31,7 +31,7 @@ import pyarrow.parquet as pq
 from datasets import load_dataset
 
 from src.data.acquire.manifest import SourceManifest
-from src.data.core.normalize import validate_example
+from src.data.core.normalize import normalize_example, validate_example
 from src.tokenization import encode_example
 from src.tokenization.tokenizer import OPT_ID
 
@@ -87,7 +87,7 @@ def finalize(r):
         return None
     for attempt in range(10):
         try:
-            enc = encode_example(r)
+            enc = encode_example(normalize_example(r))
             if len(enc.input_ids) <= 512 and sum(
                 1 for t in enc.input_ids if int(t) == OPT_ID
             ) == len(r["options"]):
