@@ -42,7 +42,7 @@ TARGETS = {
     "cais/mmlu#auxiliary_train": 65000,
     "nvidia/Aegis-AI-Content-Safety-Dataset-2.0": 29000,
     "AbstentionBench-derived": 20000,
-    "truthfulqa/truthful_qa": 6000,
+    "truthfulqa/truthful_qa": 3163,
     "cais/mmlu#auxiliary_train-derived-binary": 22000,
     "nvidia/HelpSteer2": 16500,
 }
