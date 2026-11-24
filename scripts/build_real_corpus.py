@@ -38,13 +38,13 @@ from src.tokenization.tokenizer import OPT_ID
 RNG = random.Random(20261124)
 
 TARGETS = {
-    "Anthropic/hh-rlhf": 52000,
-    "cais/mmlu#auxiliary_train": 140000,
-    "nvidia/Aegis-AI-Content-Safety-Dataset-2.0": 42000,
-    "AbstentionBench-derived": 38000,
+    "Anthropic/hh-rlhf": 48000,
+    "cais/mmlu#auxiliary_train": 65000,
+    "nvidia/Aegis-AI-Content-Safety-Dataset-2.0": 29000,
+    "AbstentionBench-derived": 20000,
     "truthfulqa/truthful_qa": 3163,
-    "cais/mmlu#auxiliary_train-derived-binary": 70000,
-    "nvidia/HelpSteer2": 26000,
+    "cais/mmlu#auxiliary_train-derived-binary": 22000,
+    "nvidia/HelpSteer2": 16500,
 }
 LICENSES = {
     "Anthropic/hh-rlhf": "MIT",
