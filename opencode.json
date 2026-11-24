@@ -1,0 +1,17 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "servers": {
+      "colab-mcp": {
+        "type": "local",
+        "command": [
+          "uvx",
+          "git+https://github.com/googlecolab/colab-mcp"
+        ],
+        "timeout": {
+          "startup": 120000
+        }
+      }
+    }
+  }
+}
