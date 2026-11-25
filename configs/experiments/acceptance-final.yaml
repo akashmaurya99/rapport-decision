@@ -1,0 +1,43 @@
+# RAPPORT final acceptance-scale run (Stage B) on the fixed real corpus.
+#
+# Choices, with reasons:
+#   init: scratch      - the audited partial BGE init copies 49/199 tensors and
+#                        mismatches BERT post-LN+learned-positions against this
+#                        trunk's pre-RMSNorm+RoPE; it measured WORSE than scratch
+#                        (0.7425 vs 0.7876) and is not worth the risk here.
+#   weight_mode: fixed - documented section 3.2 defaults. The learned arm
+#                        saturates at its 4.0 weight cap (total loss went to
+#                        -3.99), collapsing to a uniform 4x on all seven tasks
+#                        including the noisy scoring (Spearman ~0.01) and risk
+#                        families; fixed weights downweight those to 0.5.
+#   mixture: full      - 115.6k train rows, the pre-registered acceptance scale.
+arm: acceptance-final
+title: 115.6k final run (Stage B, fixed weights)
+question: does the model meet the pre-registered acceptance criteria on real data?
+init: scratch
+variant: compact
+layers: 12
+hidden: 384
+readout: cosine
+weight_mode: fixed
+head_only: false
+ordering: fingerprint
+mixture: full
+mixture_rows: 115600
+max_length: 512
+infer_max_length: 512
+seeds: [13]
+data_fingerprint: ""
+epochs: 8
+batch_size: 64
+lr: 3.0e-4
+head_lr: 1.0e-3
+weight_decay: 0.01
+warmup_ratio: 0.05
+schedule: cosine
+grad_clip: 1.0
+dropout: 0.1
+label_smoothing: 0.0
+optimizer: adamw
+fp16: true
+keep_last_n: 3
