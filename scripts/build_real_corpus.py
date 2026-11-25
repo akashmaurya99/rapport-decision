@@ -40,11 +40,11 @@ RNG = random.Random(20261124)
 TARGETS = {
     "Anthropic/hh-rlhf": 48000,
     "cais/mmlu#auxiliary_train": 65000,
-    "nvidia/Aegis-AI-Content-Safety-Dataset-2.0": 29000,
-    "AbstentionBench-derived": 20000,
+    "nvidia/Aegis-AI-Content-Safety-Dataset-2.0": 43000,
+    "AbstentionBench-derived": 35000,
     "truthfulqa/truthful_qa": 3163,
     "cais/mmlu#auxiliary_train-derived-binary": 22000,
-    "nvidia/HelpSteer2": 16500,
+    "nvidia/HelpSteer2": 20000,
 }
 LICENSES = {
     "Anthropic/hh-rlhf": "MIT",
