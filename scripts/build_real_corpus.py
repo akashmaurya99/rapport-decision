@@ -120,14 +120,19 @@ def mk(family, goal, state, options, source, group, **kw):
     if labels.get("scores") is not None:
         scores = labels["scores"]
         labels["scores"] = [scores[i] for i in order]
+    state_text = clip(state, 400)
+    # Group by a content prefix, not per-row identity: rows that share
+    # boilerplate must land in the SAME split, otherwise the 13-gram leakage
+    # check quarantines them as false positives (it removed >100k rows).
+    content_group = gid(family, state_text[:100])
     return {
         "task_family": family,
         "goal": clip(goal, 200),
-        "state": clip(state, 400),
+        "state": state_text,
         "options": new_options,
         "source": source,
         "license": LICENSES[source],
-        "group_id": group,
+        "group_id": content_group,
         "split": "train",
         **labels,
     }
